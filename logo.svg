@@ -1,0 +1,112 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- Define gradients -->
+  <defs>
+    <!-- Teal to emerald gradient for terminal -->
+    <linearGradient id="terminalGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#10B981;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#059669;stop-opacity:1" />
+    </linearGradient>
+
+    <!-- Purple gradient for messaging -->
+    <linearGradient id="messagingGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#8B5CF6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#7C3AED;stop-opacity:1" />
+    </linearGradient>
+
+    <!-- Bright accent gradient -->
+    <linearGradient id="accentGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#10B981;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#8B5CF6;stop-opacity:1" />
+    </linearGradient>
+
+    <!-- Shadow filter -->
+    <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="4" stdDeviation="3" flood-opacity="0.15"/>
+    </filter>
+  </defs>
+
+  <!-- Background circle (optional, can be removed for transparent bg) -->
+  <circle cx="256" cy="256" r="256" fill="#F8FAFB" opacity="0.5"/>
+
+  <!-- Terminal window (left side) -->
+  <g filter="url(#shadow)">
+    <!-- Terminal frame -->
+    <rect x="60" y="100" width="160" height="200" rx="12" fill="url(#terminalGradient)" opacity="0.9"/>
+
+    <!-- Terminal window header -->
+    <rect x="60" y="100" width="160" height="30" rx="12" ry="12" fill="url(#terminalGradient)"/>
+
+    <!-- Terminal header buttons -->
+    <circle cx="80" cy="115" r="4" fill="#FBBF24" opacity="0.8"/>
+    <circle cx="93" cy="115" r="4" fill="#34D399" opacity="0.8"/>
+    <circle cx="106" cy="115" r="4" fill="#EF4444" opacity="0.8"/>
+
+    <!-- Terminal content area (dark background) -->
+    <rect x="60" y="130" width="160" height="170" rx="0" ry="0" fill="#0F172A"/>
+
+    <!-- Terminal text lines (cursor and text) -->
+    <text x="72" y="150" font-family="Monaco, monospace" font-size="10" fill="#10B981" font-weight="bold">$&gt;</text>
+    <text x="85" y="150" font-family="Monaco, monospace" font-size="10" fill="#E5E7EB">claude</text>
+
+    <text x="72" y="168" font-family="Monaco, monospace" font-size="9" fill="#10B981">›</text>
+    <text x="80" y="168" font-family="Monaco, monospace" font-size="9" fill="#A1A5B0">ready...</text>
+
+    <!-- Blinking cursor indicator -->
+    <rect x="72" y="183" width="2" height="10" fill="#10B981" opacity="0.7"/>
+  </g>
+
+  <!-- Chat bubble (right side) -->
+  <g filter="url(#shadow)">
+    <!-- Chat bubble background -->
+    <path d="M 292 140 L 412 140 Q 422 140 422 150 L 422 270 Q 422 280 412 280 L 302 280 L 290 295 L 295 280 L 302 280 Q 292 280 292 270 L 292 150 Q 292 140 302 140 Z" fill="url(#messagingGradient)" opacity="0.9"/>
+
+    <!-- Chat lines (text representation) -->
+    <line x1="305" y1="160" x2="405" y2="160" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.9"/>
+    <line x1="305" y1="175" x2="395" y2="175" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+    <line x1="305" y1="190" x2="380" y2="190" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+    <line x1="305" y1="210" x2="400" y2="210" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.9"/>
+    <line x1="305" y1="225" x2="385" y2="225" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+    <line x1="305" y1="240" x2="370" y2="240" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+    <line x1="305" y1="260" x2="390" y2="260" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.8"/>
+  </g>
+
+  <!-- Central "+" symbol (intersection point) -->
+  <g filter="url(#shadow)">
+    <!-- Outer circle background -->
+    <circle cx="256" cy="256" r="48" fill="url(#accentGradient)" opacity="0.95"/>
+
+    <!-- Inner dark circle for contrast -->
+    <circle cx="256" cy="256" r="42" fill="#FFFFFF"/>
+
+    <!-- Plus symbol -->
+    <g>
+      <!-- Horizontal bar -->
+      <rect x="228" y="248" width="56" height="16" rx="4" fill="url(#accentGradient)"/>
+      <!-- Vertical bar -->
+      <rect x="248" y="228" width="16" height="56" rx="4" fill="url(#accentGradient)"/>
+    </g>
+  </g>
+
+  <!-- Connecting flow lines (subtle) -->
+  <g opacity="0.4" stroke-width="2" stroke-linecap="round">
+    <!-- Arc from terminal to plus -->
+    <path d="M 220 200 Q 240 230 208 256" stroke="url(#accentGradient)" fill="none"/>
+    <!-- Arc from chat to plus -->
+    <path d="M 292 200 Q 272 230 304 256" stroke="url(#accentGradient)" fill="none"/>
+  </g>
+
+  <!-- Optional: Decorative dots for AI/connection theme -->
+  <g opacity="0.6">
+    <!-- Dot 1 (top left) -->
+    <circle cx="100" cy="80" r="3" fill="#10B981"/>
+    <!-- Dot 2 (top right) -->
+    <circle cx="412" cy="95" r="3" fill="#8B5CF6"/>
+    <!-- Dot 3 (bottom left) -->
+    <circle cx="85" cy="380" r="3" fill="#8B5CF6"/>
+    <!-- Dot 4 (bottom right) -->
+    <circle cx="420" cy="360" r="3" fill="#10B981"/>
+  </g>
+
+  <!-- Outer accent ring (subtle) -->
+  <circle cx="256" cy="256" r="250" fill="none" stroke="url(#accentGradient)" stroke-width="2" opacity="0.15"/>
+</svg>

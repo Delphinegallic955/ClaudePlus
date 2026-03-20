@@ -1,0 +1,28 @@
+# Telegram credentials - NEVER commit these
+telegram-config.json
+config.json
+
+# Backup files
+*.bak
+*.fixed
+*.old
+
+# Temp files
+*.tmp
+*.log
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# PowerShell
+*.psm1.bak
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Preview files
+logo.html
