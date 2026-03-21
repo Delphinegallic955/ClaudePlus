@@ -122,54 +122,60 @@ function Read-ClaudeConsole {
 # Compare RAW text for stabilization. Minimal cleaning only for Telegram.
 # ============================================================================
 
+function Get-ConsoleHash {
+    param([string]$Text)
+    if (-not $Text) { return "" }
+    # Strip last 2 lines (status bar may update dynamically) + normalize
+    $lines = $Text -split "`r?`n"
+    if ($lines.Count -gt 2) { $lines = $lines[0..($lines.Count - 3)] }
+    $normalized = ($lines | ForEach-Object { $_.TrimEnd() } | Where-Object { $_.Length -gt 0 }) -join "`n"
+    # Remove control chars
+    $normalized = $normalized -replace '[\u0000-\u001F\u007F]', ''
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    return [System.BitConverter]::ToString($md5.ComputeHash($bytes))
+}
+
 function Wait-ClaudeResponse {
     param([int]$CmdPid, [string]$BaselineRaw, [int]$MaxWaitSec = 120)
 
     $pollInterval = 3
     $stableNeeded = 2
 
-    # Use LENGTH for comparison — TUI redraws characters but length stays stable
-    $baseLen = 0
-    if ($BaselineRaw) {
-        $baseLines = ($BaselineRaw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 })
-        $baseLen = ($baseLines -join "").Length
-    }
+    # NEW STRATEGY: compare CONSECUTIVE reads (hash-based)
+    # This works even when total console length stays constant (fixed-size window)
+    $baseHash = Get-ConsoleHash $BaselineRaw
 
-    Write-Host "[ClaudePlus] Attente reponse (baseline len=$baseLen)..." -ForegroundColor DarkGray
+    Write-Host "[ClaudePlus] Attente reponse (baseHash=$($baseHash.Substring(0,8))...)..." -ForegroundColor DarkGray
 
+    # Wait for Claude to start responding
     Start-Sleep -Seconds 5
 
-    $previousLen = 0
+    $previousHash = ""
     $stableCount = 0
-    $elapsed = 5
     $stableRaw = ""
+    $elapsed = 5
 
     while ($elapsed -lt $MaxWaitSec) {
         $currentRaw = Read-ClaudeConsole -CmdPid $CmdPid
         if (-not $currentRaw) {
-            Write-Host "[ClaudePlus] Poll $elapsed s: lecture echouee" -ForegroundColor Red
+            Write-Host "[ClaudePlus] Poll ${elapsed}s: lecture echouee" -ForegroundColor Red
             Start-Sleep -Seconds $pollInterval
             $elapsed += $pollInterval
             continue
         }
 
-        $curLines = ($currentRaw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 })
-        $curLen = ($curLines -join "").Length
-        $changed = ($curLen -ne $baseLen)
+        $curHash = Get-ConsoleHash $currentRaw
+        $changedFromBase = ($curHash -ne $baseHash)
+        $sameAsPrevious = ($curHash -eq $previousHash -and $previousHash -ne "")
 
-        Write-Host "[ClaudePlus] Poll $elapsed s: len=$curLen (base=$baseLen) change=$changed stable=$stableCount" -ForegroundColor DarkGray
+        Write-Host "[ClaudePlus] Poll ${elapsed}s: changed=$changedFromBase stable=$stableCount hash=$($curHash.Substring(0,8))" -ForegroundColor DarkGray
 
-        if (-not $changed) {
-            Start-Sleep -Seconds $pollInterval
-            $elapsed += $pollInterval
-            continue
-        }
-
-        # Length changed from baseline — check if stabilized
-        if ($curLen -eq $previousLen -and $previousLen -gt 0) {
+        if ($sameAsPrevious) {
             $stableCount++
+            Write-Host "[ClaudePlus] Stable $stableCount/$stableNeeded" -ForegroundColor DarkYellow
             if ($stableCount -ge $stableNeeded) {
-                Write-Host "[ClaudePlus] Reponse stabilisee! (len=$curLen)" -ForegroundColor Green
+                Write-Host "[ClaudePlus] Reponse stabilisee!" -ForegroundColor Green
 
                 # Debug dump
                 try {
@@ -183,13 +189,15 @@ function Wait-ClaudeResponse {
                 } catch {
                     Write-Host "[ClaudePlus] Erreur extraction: $_" -ForegroundColor Red
                 }
+
                 if ($newContent) {
                     Write-Host "[ClaudePlus] Extrait: $($newContent.Length) chars" -ForegroundColor Magenta
                 } else {
-                    Write-Host "[ClaudePlus] Extraction vide, envoi dump complet" -ForegroundColor Yellow
-                    # Fallback: send all current lines that have content
-                    $newContent = ($curLines | Where-Object { $_.Length -gt 2 }) -join "`n"
+                    Write-Host "[ClaudePlus] Extraction vide, fallback dump" -ForegroundColor Yellow
+                    $curLines = ($currentRaw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 2 })
+                    $newContent = $curLines -join "`n"
                 }
+
                 $script:LastConsoleText = $currentRaw
                 return $newContent
             }
@@ -197,7 +205,7 @@ function Wait-ClaudeResponse {
             $stableCount = 0
         }
 
-        $previousLen = $curLen
+        $previousHash = $curHash
         $stableRaw = $currentRaw
         Start-Sleep -Seconds $pollInterval
         $elapsed += $pollInterval
