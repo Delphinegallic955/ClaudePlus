@@ -1098,7 +1098,7 @@ function Invoke-ClaudePipe {
     }
 }
 
-# Fallback plain pipe mode (no streaming, no Telegram updates)
+# Plain pipe mode with detailed logging (no streaming, no Telegram updates)
 function Invoke-ClaudePipePlain {
     param(
         [string]$Message,
@@ -1114,6 +1114,8 @@ function Invoke-ClaudePipePlain {
     if ($DangerouslySkipPermissions) { $argList += "--dangerously-skip-permissions" }
     $argStr = $argList -join " "
 
+    Write-Host "[ClaudePlus] PipePlain: $ClaudePath $argStr" -ForegroundColor DarkGray
+
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $ClaudePath
@@ -1126,16 +1128,48 @@ function Invoke-ClaudePipePlain {
         $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
         $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 
+        $startTime = Get-Date
         $proc = [System.Diagnostics.Process]::Start($psi)
+        Write-Host "[ClaudePlus] PipePlain: process PID=$($proc.Id) lance" -ForegroundColor DarkGray
+
         $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
         $stderrTask = $proc.StandardError.ReadToEndAsync()
-        $exited = $proc.WaitForExit(180000)
-        if (-not $exited) { try { $proc.Kill() } catch { }; return $null }
 
-        $result = $stdoutTask.Result.Trim()
-        if ($result.Length -gt 0) { return $result }
-        $stderr = $stderrTask.Result.Trim()
-        if ($stderr.Length -gt 10) { return $stderr }
+        # 5 minute timeout (claude can take long on complex tasks)
+        $exited = $proc.WaitForExit(300000)
+        $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
+
+        if (-not $exited) {
+            Write-Host "[ClaudePlus] PipePlain: TIMEOUT 5min, kill" -ForegroundColor Red
+            try { $proc.Kill() } catch { }
+            return $null
+        }
+
+        $exitCode = $proc.ExitCode
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+
+        Write-Host "[ClaudePlus] PipePlain: exit=$exitCode, ${elapsed}s, stdout=$($stdout.Length), stderr=$($stderr.Length)" -ForegroundColor DarkGray
+
+        if ($stderr -and $stderr.Trim().Length -gt 0) {
+            $stderrPreview = $stderr.Substring(0, [Math]::Min(200, $stderr.Length))
+            Write-Host "[ClaudePlus] PipePlain stderr: $stderrPreview" -ForegroundColor DarkGray
+        }
+
+        $result = $stdout.Trim()
+        if ($result.Length -gt 0) {
+            Write-Host "[ClaudePlus] PipePlain: OK ($($result.Length) chars)" -ForegroundColor Green
+            return $result
+        }
+
+        # stdout empty — check stderr for useful content
+        $stderrClean = $stderr.Trim()
+        if ($stderrClean.Length -gt 10 -and $stderrClean -notmatch "^Usage:|^Error:|^warn") {
+            Write-Host "[ClaudePlus] PipePlain: utilise stderr comme reponse" -ForegroundColor Yellow
+            return $stderrClean
+        }
+
+        Write-Host "[ClaudePlus] PipePlain: reponse VIDE (exit=$exitCode)" -ForegroundColor Red
         return $null
     } catch {
         Write-Host "[ClaudePlus] PipePlain erreur: $_" -ForegroundColor Red
@@ -1724,16 +1758,51 @@ function Invoke-ClaudePlus {
                             # HYBRID: also send to TUI terminal for visual display
                             Send-TextToClaude -Text $text | Out-Null
 
-                            # Use streaming pipe mode for clean response + real-time Telegram updates
+                            # PIPE WITH RETRY ESCALATION:
+                            # Attempt 1: stream-json (real-time updates)
+                            # Attempt 2: plain pipe with --continue
+                            # Attempt 3: plain pipe WITHOUT --continue (fresh session)
                             $useSkip = ($config.DangerouslySkipPermissions -eq $true)
+                            $responseText = $null
+                            $useContinue = ($script:PipeMessageCount -gt 0)
+
+                            # Attempt 1: stream-json
+                            Write-Host "[ClaudePlus] Tentative 1/3: stream-json..." -ForegroundColor DarkGray
                             $responseText = Invoke-ClaudePipe `
                                 -Message $text `
                                 -ClaudePath $claudePath `
                                 -WorkDir $workDir `
-                                -Continue:($script:PipeMessageCount -gt 0) `
+                                -Continue:$useContinue `
                                 -DangerouslySkipPermissions:$useSkip `
                                 -TelegramToken $config.TelegramBotToken `
                                 -TelegramChatId $config.TelegramChatId
+
+                            # Attempt 2: plain pipe with --continue
+                            if (-not $responseText -or $responseText.Length -le 3) {
+                                Write-Host "[ClaudePlus] Tentative 2/3: pipe plain + continue..." -ForegroundColor Yellow
+                                Start-Sleep -Seconds 2
+                                $responseText = Invoke-ClaudePipePlain `
+                                    -Message $text `
+                                    -ClaudePath $claudePath `
+                                    -WorkDir $workDir `
+                                    -Continue:$useContinue `
+                                    -DangerouslySkipPermissions:$useSkip
+                            }
+
+                            # Attempt 3: plain pipe WITHOUT --continue (fresh session)
+                            if (-not $responseText -or $responseText.Length -le 3) {
+                                Write-Host "[ClaudePlus] Tentative 3/3: pipe plain SANS continue (session fraiche)..." -ForegroundColor Yellow
+                                Start-Sleep -Seconds 3
+                                $responseText = Invoke-ClaudePipePlain `
+                                    -Message $text `
+                                    -ClaudePath $claudePath `
+                                    -WorkDir $workDir `
+                                    -DangerouslySkipPermissions:$useSkip
+                                # Reset continue counter since we started fresh
+                                if ($responseText -and $responseText.Length -gt 3) {
+                                    $script:PipeMessageCount = 0
+                                }
+                            }
 
                             $script:PipeMessageCount++
                             $waitingForResponse = $false
@@ -1752,9 +1821,9 @@ function Invoke-ClaudePlus {
                                 $finalMsg = "$([char]0x2500)$([char]0x2500) @$Name $([char]0x2500)$([char]0x2500)`n$responseText"
                                 Send-TelegramMessage -Message $finalMsg -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                             } else {
-                                Write-Host "  << [pas de reponse]" -ForegroundColor Yellow
+                                Write-Host "  << [ECHEC 3 tentatives]" -ForegroundColor Red
                                 Write-Host ""
-                                Send-TelegramMessage -Message "[@$Name] Pas de reponse - verifiez le terminal" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                Send-TelegramMessage -Message "[@$Name] Echec apres 3 tentatives. Verifiez le terminal ou renvoyez le message." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                             }
                         }
                     }
