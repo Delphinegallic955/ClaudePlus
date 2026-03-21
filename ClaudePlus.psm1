@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 # ClaudePlus PowerShell Module
 # Wraps Claude Code with Telegram bidirectional mirror
 # Author: Majid - FiscalIQ
@@ -16,102 +16,173 @@ $script:WshShell = New-Object -ComObject WScript.Shell
 # No direct P/Invoke for console write - PowerShell shares its own console
 # All WriteConsoleInput calls go through a helper process (see Send-TextToClaude)
 
-# UI Automation for reading console text
-try {
-    Add-Type -AssemblyName UIAutomationClient
-    Add-Type -AssemblyName UIAutomationTypes
-} catch { }
-
 $script:LastConsoleText = ""
-$script:ConsoleReaderScript = $null
+$script:ReaderExe = $null
 
 # ============================================================================
-# READ CLAUDE CONSOLE OUTPUT (via helper process + AttachConsole)
+# READ CLAUDE CONSOLE OUTPUT
+# Strategy: Compile a standalone .exe (once) that does:
+#   FreeConsole + AttachConsole(pid) + CreateFile("CONOUT$") + ReadConsoleOutputCharacter
+# The .exe runs as a separate process with no PS overhead.
 # ============================================================================
 
 function Initialize-ConsoleReader {
-    # Create a helper PowerShell script that reads a console buffer
-    $script:ConsoleReaderScript = "$env:TEMP\claudeplus_reader.ps1"
+    $script:ReaderExe = "$env:TEMP\claudeplus_reader.exe"
 
-    $readerCode = @'
-param([int]$TargetPid, [string]$OutputFile)
-Add-Type @"
+    # Reuse compiled exe if it exists (fast startup)
+    if (Test-Path $script:ReaderExe) {
+        Write-Host "[ClaudePlus] Lecteur console OK (exe)" -ForegroundColor DarkGray
+        return
+    }
+
+    # Find csc.exe (.NET Framework compiler)
+    $cscPath = $null
+    $fwDirs = @(
+        "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319",
+        "$env:SystemRoot\Microsoft.NET\Framework\v4.0.30319"
+    )
+    foreach ($d in $fwDirs) {
+        $p = Join-Path $d "csc.exe"
+        if (Test-Path $p) { $cscPath = $p; break }
+    }
+    if (-not $cscPath) {
+        Write-Host "[ClaudePlus] WARN: csc.exe introuvable, lecteur desactive" -ForegroundColor Yellow
+        $script:ReaderExe = $null
+        return
+    }
+
+    # Write C# source
+    $csFile = "$env:TEMP\claudeplus_reader.cs"
+    $csSource = @'
 using System;
+using System.IO;
 using System.Text;
 using System.Runtime.InteropServices;
-public class ConReader {
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool AttachConsole(int pid);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool FreeConsole();
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern IntPtr GetStdHandle(int nStdHandle);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool GetConsoleScreenBufferInfo(IntPtr h, out CSBI info);
+class Program {
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool FreeConsole();
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool AttachConsole(int pid);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetConsoleScreenBufferInfo(IntPtr h, out CSBI i);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    public static extern bool ReadConsoleOutputCharacter(IntPtr h, StringBuilder buf, int len, COORD coord, out int read);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct COORD { public short X; public short Y; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct SMALL_RECT { public short Left, Top, Right, Bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct CSBI {
-        public COORD dwSize;
-        public COORD dwCursorPosition;
-        public short wAttributes;
-        public SMALL_RECT srWindow;
-        public COORD dwMaximumWindowSize;
-    }
-    public static string Read(int pid) {
+    static extern bool ReadConsoleOutputCharacter(IntPtr h, StringBuilder b, int len, COORD c, out int nr);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern uint GetLastError();
+    [StructLayout(LayoutKind.Sequential)] public struct COORD { public short X, Y; }
+    [StructLayout(LayoutKind.Sequential)] public struct SRECT { public short L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential)] public struct CSBI { public COORD sz, cur; public short attr; public SRECT win; public COORD maxsz; }
+    static int Main(string[] args) {
+        if (args.Length < 2) { Console.Error.WriteLine("Usage: reader.exe outputFile pid1 [pid2 ...]"); return 1; }
+        string outFile = args[0];
         FreeConsole();
-        if (!AttachConsole(pid)) return null;
-        try {
-            IntPtr h = GetStdHandle(-11);
+        for (int i = 1; i < args.Length; i++) {
+            int pid;
+            if (!int.TryParse(args[i], out pid) || pid <= 0) continue;
+            Console.Error.Write("PID " + pid + ": ");
+            bool attached = AttachConsole(pid);
+            if (!attached) { Console.Error.WriteLine("ATTACH_FAIL:" + GetLastError()); continue; }
+            IntPtr h = CreateFile("CONOUT$", 0x80000000|0x40000000, 1|2, IntPtr.Zero, 3, 0, IntPtr.Zero);
+            if (h == IntPtr.Zero || h == new IntPtr(-1)) { Console.Error.WriteLine("CONOUT_FAIL:" + GetLastError()); FreeConsole(); continue; }
             CSBI info;
-            if (!GetConsoleScreenBufferInfo(h, out info)) return null;
-            int w = info.dwSize.X;
-            StringBuilder result = new StringBuilder();
-            for (int y = info.srWindow.Top; y <= info.srWindow.Bottom; y++) {
-                StringBuilder line = new StringBuilder(w);
-                COORD c = new COORD { X = 0, Y = (short)y };
+            if (!GetConsoleScreenBufferInfo(h, out info)) { Console.Error.WriteLine("CSBI_FAIL:" + GetLastError()); CloseHandle(h); FreeConsole(); continue; }
+            int w = info.sz.X;
+            var sb = new StringBuilder();
+            // Read visible window only (TUI uses alternate screen buffer)
+            for (int y = info.win.T; y <= info.win.B; y++) {
+                var line = new StringBuilder(w + 2);
+                COORD c; c.X = 0; c.Y = (short)y;
                 int nr;
                 ReadConsoleOutputCharacter(h, line, w, c, out nr);
-                result.AppendLine(line.ToString().TrimEnd());
+                sb.AppendLine(line.ToString().TrimEnd());
             }
-            return result.ToString();
-        } finally { FreeConsole(); }
+            CloseHandle(h); FreeConsole();
+            string result = sb.ToString();
+            if (result.Trim().Length > 20) {
+                File.WriteAllText(outFile, result, Encoding.UTF8);
+                Console.Error.WriteLine("SUCCESS (" + result.Length + " chars)");
+                return 0;
+            }
+            Console.Error.WriteLine("TOO_SHORT:" + result.Trim().Length);
+        }
+        Console.Error.WriteLine("All PIDs failed");
+        return 1;
     }
 }
-"@
-try {
-    $text = [ConReader]::Read($TargetPid)
-    if ($text) { [System.IO.File]::WriteAllText($OutputFile, $text, [System.Text.Encoding]::UTF8) }
-} catch { }
 '@
+    [System.IO.File]::WriteAllText($csFile, $csSource, [System.Text.Encoding]::UTF8)
 
-    [System.IO.File]::WriteAllText($script:ConsoleReaderScript, $readerCode, [System.Text.Encoding]::ASCII)
+    # Compile
+    Write-Host "[ClaudePlus] Compilation lecteur console..." -ForegroundColor DarkGray
+    $compileResult = & $cscPath /nologo /optimize /out:$script:ReaderExe /target:exe $csFile 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[ClaudePlus] WARN: Echec compilation: $compileResult" -ForegroundColor Yellow
+        $script:ReaderExe = $null
+    } else {
+        Write-Host "[ClaudePlus] Lecteur compile OK" -ForegroundColor Green
+    }
+    Remove-Item $csFile -ErrorAction SilentlyContinue
+}
+
+function Get-ClaudeChildPids {
+    param([int]$CmdPid)
+    $pids = @()
+    if ($CmdPid -le 0) { return $pids }
+    try {
+        $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$CmdPid" -ErrorAction SilentlyContinue
+        foreach ($child in $children) {
+            $pids += [int]$child.ProcessId
+            $gcs = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($child.ProcessId)" -ErrorAction SilentlyContinue
+            foreach ($gc in $gcs) { $pids += [int]$gc.ProcessId }
+        }
+    } catch {}
+    return $pids
 }
 
 function Read-ClaudeConsole {
     param([int]$CmdPid)
 
     if ($CmdPid -le 0) { return $null }
-    if (-not $script:ConsoleReaderScript -or -not (Test-Path $script:ConsoleReaderScript)) { return $null }
+    if (-not $script:ReaderExe -or -not (Test-Path $script:ReaderExe)) { return $null }
 
-    $outputFile = "$env:TEMP\claudeplus_console_$CmdPid.txt"
+    $outputFile = "$env:TEMP\claudeplus_console_out.txt"
+    Remove-Item $outputFile -ErrorAction SilentlyContinue
 
-    # Run helper in hidden window (separate process = separate console)
+    # Build PID list: grandchildren first (claude.exe/node.exe), then cmd.exe
+    $allPids = @()
+    $childPids = Get-ClaudeChildPids -CmdPid $CmdPid
+    $allPids += $childPids
+    $allPids += $CmdPid
+    $pidArgs = ($allPids | ForEach-Object { $_.ToString() }) -join " "
+
     try {
-        $proc = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$($script:ConsoleReaderScript)`" -TargetPid $CmdPid -OutputFile `"$outputFile`"" -PassThru -WindowStyle Hidden
-        $proc.WaitForExit(5000) | Out-Null
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $script:ReaderExe
+        $psi.Arguments = "`"$outputFile`" $pidArgs"
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardError = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit(10000) | Out-Null
         if (-not $proc.HasExited) { $proc.Kill() }
-    } catch { return $null }
+
+        # Show diagnostics from stderr (always)
+        if ($stderr) {
+            foreach ($line in ($stderr -split "`r?`n" | Where-Object { $_.Trim().Length -gt 0 })) {
+                $col = if ($line -match "SUCCESS") { "Green" } else { "Cyan" }
+                Write-Host "[Reader] $line" -ForegroundColor $col
+            }
+        }
+    } catch {
+        Write-Host "[Reader] Erreur lancement: $_" -ForegroundColor Red
+        return $null
+    }
 
     if (Test-Path $outputFile) {
         try {
             $text = [System.IO.File]::ReadAllText($outputFile, [System.Text.Encoding]::UTF8)
             Remove-Item $outputFile -ErrorAction SilentlyContinue
-            return $text
+            if ($text -and $text.Trim().Length -gt 5) { return $text }
         } catch { }
     }
     return $null
@@ -140,132 +211,183 @@ function Wait-ClaudeResponse {
     param([int]$CmdPid, [string]$BaselineRaw, [int]$MaxWaitSec = 120)
 
     $pollInterval = 3
-    $stableNeeded = 2
+    $stableNeeded = 3
 
-    # NEW STRATEGY: compare CONSECUTIVE reads (hash-based)
-    # This works even when total console length stays constant (fixed-size window)
-    $baseHash = Get-ConsoleHash $BaselineRaw
+    # STRATEGY v3: The TUI cursor blink corrupts a few chars on every read,
+    # making exact text comparison impossible. Instead we count consecutive
+    # polls where a response EXISTS (>10 chars) with SIMILAR length (+-20).
+    # After 3 consecutive similar-length detections, return the longest one.
 
-    Write-Host "[ClaudePlus] Attente reponse (baseHash=$($baseHash.Substring(0,8))...)..." -ForegroundColor DarkGray
+    Write-Host "[ClaudePlus] Attente reponse (v3)..." -ForegroundColor DarkGray
 
-    # Wait for Claude to start responding
     Start-Sleep -Seconds 5
 
-    $previousHash = ""
-    $stableCount = 0
-    $stableRaw = ""
+    $consecutiveHits = 0
+    $previousLen = 0
+    $bestExtracted = ""
     $elapsed = 5
 
     while ($elapsed -lt $MaxWaitSec) {
         $currentRaw = Read-ClaudeConsole -CmdPid $CmdPid
         if (-not $currentRaw) {
             Write-Host "[ClaudePlus] Poll ${elapsed}s: lecture echouee" -ForegroundColor Red
+            $consecutiveHits = 0
             Start-Sleep -Seconds $pollInterval
             $elapsed += $pollInterval
             continue
         }
 
-        $curHash = Get-ConsoleHash $currentRaw
-        $changedFromBase = ($curHash -ne $baseHash)
-        $sameAsPrevious = ($curHash -eq $previousHash -and $previousHash -ne "")
+        $extracted = $null
+        try {
+            $extracted = Extract-NewLines -BaselineRaw $BaselineRaw -CurrentRaw $currentRaw
+        } catch { }
 
-        Write-Host "[ClaudePlus] Poll ${elapsed}s: changed=$changedFromBase stable=$stableCount hash=$($curHash.Substring(0,8))" -ForegroundColor DarkGray
+        if ($extracted -and $extracted.Length -gt 10) {
+            $curLen = $extracted.Length
 
-        if ($sameAsPrevious) {
-            $stableCount++
-            Write-Host "[ClaudePlus] Stable $stableCount/$stableNeeded" -ForegroundColor DarkYellow
-            if ($stableCount -ge $stableNeeded) {
-                Write-Host "[ClaudePlus] Reponse stabilisee!" -ForegroundColor Green
-
-                # Debug dump
-                try {
-                    [System.IO.File]::WriteAllText("$env:TEMP\claudeplus_baseline.txt", $BaselineRaw, [System.Text.Encoding]::UTF8)
-                    [System.IO.File]::WriteAllText("$env:TEMP\claudeplus_response.txt", $currentRaw, [System.Text.Encoding]::UTF8)
-                } catch { }
-
-                $newContent = $null
-                try {
-                    $newContent = Extract-NewLines -BaselineRaw $BaselineRaw -CurrentRaw $currentRaw
-                } catch {
-                    Write-Host "[ClaudePlus] Erreur extraction: $_" -ForegroundColor Red
-                }
-
-                if ($newContent) {
-                    Write-Host "[ClaudePlus] Extrait: $($newContent.Length) chars" -ForegroundColor Magenta
-                } else {
-                    Write-Host "[ClaudePlus] Extraction vide, fallback dump" -ForegroundColor Yellow
-                    $curLines = ($currentRaw -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 2 })
-                    $newContent = $curLines -join "`n"
-                }
-
-                $script:LastConsoleText = $currentRaw
-                return $newContent
+            # Keep the longest extraction
+            if ($curLen -gt $bestExtracted.Length) {
+                $bestExtracted = $extracted
             }
+
+            # Check if length is similar to previous (within +-20 chars)
+            if ($previousLen -gt 0 -and [Math]::Abs($curLen - $previousLen) -le 20) {
+                $consecutiveHits++
+                Write-Host "[ClaudePlus] Poll ${elapsed}s: STABLE $consecutiveHits/$stableNeeded ($curLen chars, prev=$previousLen)" -ForegroundColor DarkYellow
+                if ($consecutiveHits -ge $stableNeeded) {
+                    Write-Host "[ClaudePlus] Reponse capturee! ($($bestExtracted.Length) chars)" -ForegroundColor Green
+                    $script:LastConsoleText = $currentRaw
+                    return $bestExtracted
+                }
+            } else {
+                $consecutiveHits = 0
+                Write-Host "[ClaudePlus] Poll ${elapsed}s: reponse en cours ($curLen chars, delta=$([Math]::Abs($curLen - $previousLen)))" -ForegroundColor DarkGray
+            }
+            $previousLen = $curLen
         } else {
-            $stableCount = 0
+            $consecutiveHits = 0
+            $previousLen = 0
+            Write-Host "[ClaudePlus] Poll ${elapsed}s: pas encore de reponse" -ForegroundColor DarkGray
         }
 
-        $previousHash = $curHash
-        $stableRaw = $currentRaw
         Start-Sleep -Seconds $pollInterval
         $elapsed += $pollInterval
     }
 
-    Write-Host "[ClaudePlus] Timeout ($MaxWaitSec s)" -ForegroundColor Yellow
+    # Timeout but we have something -- return best effort
+    if ($bestExtracted.Length -gt 10) {
+        Write-Host "[ClaudePlus] Timeout mais reponse partielle ($($bestExtracted.Length) chars)" -ForegroundColor Yellow
+        return $bestExtracted
+    }
+
+    Write-Host "[ClaudePlus] Timeout - aucune reponse" -ForegroundColor Yellow
     return $null
 }
 
 # Extract Claude's actual response from console output
-# Compares with baseline, strips TUI chrome, keeps only meaningful content
+# Strategy 1: locate the ● response marker and capture what follows
+# Strategy 2: diff from baseline as fallback
 function Extract-NewLines {
     param([string]$BaselineRaw, [string]$CurrentRaw)
 
-    $baseLines = $BaselineRaw -split "`r?`n" | ForEach-Object { $_.TrimEnd() }
-    $currLines = $CurrentRaw -split "`r?`n" | ForEach-Object { $_.TrimEnd() }
+    # Remove raw control chars before processing
+    $cleanedCurrent = $CurrentRaw -replace '[\u0000-\u001F\u007F]', ' '
 
-    # Build set of baseline lines
+    # ---- STRATEGY 1: find ● (Claude's response marker) ----
+    $lines = $cleanedCurrent -split "`r?`n"
+    $responseLines = @()
+    $capturing = $false
+    $emptyLineCount = 0
+
+    foreach ($line in $lines) {
+        $t = $line.TrimEnd()
+
+        # Does this line contain the ● marker?
+        if ($t -match '[\u25CF]') {
+            $capturing = $true
+            $emptyLineCount = 0
+            # Take everything AFTER the ● (and optional space)
+            $after = ($t -replace '^.*[\u25CF]\s*', '').TrimEnd()
+            $after = Remove-TuiChars $after
+            $after = $after.Trim()
+            if ($after.Length -gt 1) { $responseLines += $after }
+            continue
+        }
+
+        if ($capturing) {
+            $trimmed = $t.Trim()
+
+            # Stop capturing on these conditions:
+            # Empty/very short line (2 in a row = end of response)
+            if ($trimmed.Length -le 1) {
+                $emptyLineCount++
+                if ($emptyLineCount -ge 2) { $capturing = $false }
+                continue
+            }
+            $emptyLineCount = 0
+
+            # Stop at prompt line
+            if ($trimmed -match '^>\s') { $capturing = $false; continue }
+
+            # Stop at TUI status bar keywords
+            if ($trimmed -match 'Opus|Sonnet|Haiku|context\)|MCP server|bypass perm|shift.tab|\.PowerShell|\.Documents|\.Desktop') {
+                $capturing = $false; continue
+            }
+
+            # Stop at TUI noise (box-drawing, block elements)
+            if (Test-IsTuiNoise $trimmed) { $capturing = $false; continue }
+
+            $clean = Remove-TuiChars $trimmed
+            $clean = $clean.Trim()
+
+            # Skip single-char garbage (x, Ϙ, etc.)
+            if ($clean.Length -le 2) { continue }
+
+            # Skip lines that are mostly non-letter chars
+            $letterCount = ($clean -replace '[^a-zA-Z\u00C0-\u00FF]', '').Length
+            if ($clean.Length -gt 5 -and $letterCount -lt ($clean.Length / 3)) { continue }
+
+            $responseLines += $clean
+        }
+    }
+
+    if ($responseLines.Count -gt 0) {
+        $result = $responseLines -join "`n"
+        if ($result.Length -gt 3800) { $result = $result.Substring(0, 3800) + "`n[... tronque]" }
+        return $result.Trim()
+    }
+
+    # ---- STRATEGY 2: diff-based fallback ----
+    $baseLines = $BaselineRaw -split "`r?`n" | ForEach-Object { $_.TrimEnd() }
+    $currLines = $cleanedCurrent -split "`r?`n" | ForEach-Object { $_.TrimEnd() }
+
     $baseSet = @{}
     foreach ($line in $baseLines) {
         $t = $line.Trim()
         if ($t.Length -gt 0) { $baseSet[$t] = $true }
     }
 
-    # Find new lines and clean them
     $newLines = @()
     foreach ($line in $currLines) {
         $t = $line.Trim()
-        if ($t.Length -eq 0) { continue }
+        if ($t.Length -lt 3) { continue }
         if ($baseSet.ContainsKey($t)) { continue }
-
-        # Skip TUI chrome
         if (Test-IsTuiNoise $t) { continue }
-
-        # Clean the line: remove box-drawing, block chars, stray Unicode artifacts
         $clean = Remove-TuiChars $t
-        $clean = $clean.Trim()
-        if ($clean.Length -lt 2) { continue }
-
-        # Skip user input echo lines ("> some text")
-        if ($clean -match '^>\s+\S') { continue }
-        # Skip empty prompt lines (just ">")
-        if ($clean -match '^>\s*$') { continue }
-
-        # Remove Claude bullet prefix
         $clean = $clean -replace '^\u25CF\s*', ''
         $clean = $clean.Trim()
-        if ($clean.Length -lt 2) { continue }
-
+        if ($clean.Length -lt 3) { continue }
+        if ($clean -match '^>\s*') { continue }
         $newLines += $clean
     }
 
-    if ($newLines.Count -eq 0) { return $null }
-
-    $result = $newLines -join "`n"
-    if ($result.Length -gt 3800) {
-        $result = $result.Substring(0, 3800) + "`n[... tronque]"
+    if ($newLines.Count -gt 0) {
+        $result = $newLines -join "`n"
+        if ($result.Length -gt 3800) { $result = $result.Substring(0, 3800) + "`n[... tronque]" }
+        return $result.Trim()
     }
 
-    return $result.Trim()
+    return $null
 }
 
 # Check if a line is TUI noise (should be skipped entirely)
@@ -279,7 +401,7 @@ function Test-IsTuiNoise {
         if ($cleaned.Length -lt ($Line.Trim().Length / 3)) { return $true }
     }
 
-    # Block elements (logo) — U+2580-U+259F
+    # Block elements (logo) -- U+2580-U+259F
     if ($Line -match '[\u2580-\u259F]') {
         $cleaned = $Line -replace '[\u2580-\u259F\u2500-\u257F\s]', ''
         if ($cleaned.Length -lt ($Line.Trim().Length / 3)) { return $true }
@@ -331,15 +453,72 @@ function Remove-TuiChars {
     $t = $t -replace '[\u00C0-\u00C6\u00C8-\u00CF\u00D0-\u00D6\u00D8-\u00DF](?=\s*$)', ''
     # Remove control chars
     $t = $t -replace '[\u0000-\u001F\u007F]', ''
-    # Remove Latin Extended artifacts (Ǥ, Ø, etc. — not used in French/Dutch)
+    # Remove Latin Extended artifacts (not used in French/Dutch)
     $t = $t -replace '[\u0100-\u024F]', ''
     $t = $t -replace '[\u00D8-\u00DF]', ''
+    # Remove Greek/Coptic artifacts
+    $t = $t -replace '[\u0370-\u03FF]', ''
+    # Remove Cyrillic artifacts
+    $t = $t -replace '[\u0400-\u04FF]', ''
+    # Remove Modifier Letters (˸ = U+02F8, etc.)
+    $t = $t -replace '[\u02B0-\u02FF]', ''
+    # Remove Spacing Modifier Letters
+    $t = $t -replace '[\u0250-\u02AF]', ''
     # Remove stray single non-text chars at end of line
     $t = $t -replace '\s*[^\x20-\x7E\u00E0-\u00F6\u00F8-\u00FF]+\s*$', ''
     # Clean up multiple spaces
     $t = $t -replace '\s{2,}', ' '
 
     return $t.Trim()
+}
+
+# Final cleanup of extracted response before sending to Telegram.
+# Cuts at status bar markers and removes remaining TUI garbage.
+# Works on the FULL response string (not per-line).
+function Clean-FinalResponse {
+    param([string]$Text)
+
+    if (-not $Text) { return "" }
+
+    # Cut everything starting from known TUI status bar patterns
+    # These patterns mark the end of Claude's actual response
+    $cutPatterns = @(
+        '\s*>?\s*Opus\s',
+        '\s*>?\s*Sonnet\s',
+        '\s*>?\s*Haiku\s',
+        '\s*\d+M context',
+        '\s*MCP server',
+        '\s*bypass perm',
+        '\s*shift.tab',
+        '\bOption\d',
+        '\bOpton\d',
+        '\d+%\s*(1\s)?MCP',
+        '\bPowerShell\b',
+        '\b/mcp\b',
+        '\bneeds auth\b'
+    )
+    foreach ($pat in $cutPatterns) {
+        if ($Text -match $pat) {
+            $idx = $Text.IndexOf(($Matches[0]))
+            if ($idx -gt 5) {
+                $Text = $Text.Substring(0, $idx)
+            }
+        }
+    }
+
+    # Remove isolated single characters surrounded by spaces (cursor artifacts: x, ˸, etc.)
+    $Text = $Text -replace '(?<=\s)[^\s\w](?=\s)', ''
+    $Text = $Text -replace '\s+\w\s+\w\s+\w\s*$', ''
+
+    # Remove stray non-ASCII non-French chars
+    $Text = $Text -replace '[\u0100-\u02FF]', ''
+    $Text = $Text -replace '[\u0370-\u04FF]', ''
+
+    # Clean up whitespace
+    $Text = $Text -replace '\s{2,}', ' '
+    $Text = $Text -replace '\s+$', ''
+
+    return $Text.Trim()
 }
 
 # ============================================================================
@@ -412,6 +591,207 @@ function Delete-TelegramWebhook {
 }
 
 # ============================================================================
+# VOICE TRANSCRIPTION (faster-whisper, auto language detection, 99+ languages)
+# ============================================================================
+
+function Initialize-Transcription {
+    # Check Python
+    $py = $null
+    foreach ($cmd in @("python", "python3", "py")) {
+        try {
+            $ver = & $cmd --version 2>&1
+            if ($ver -match "Python\s+3\.") { $py = $cmd; break }
+        } catch { }
+    }
+    if (-not $py) {
+        Write-Host "[ClaudePlus] ERREUR: Python 3.x requis pour la transcription vocale." -ForegroundColor Red
+        Write-Host "[ClaudePlus] Installez Python: https://www.python.org/downloads/" -ForegroundColor Yellow
+        return $false
+    }
+    Write-Host "[ClaudePlus] Python OK: $py" -ForegroundColor DarkGray
+
+    # Check/install faster-whisper
+    $checkWhisper = (& $py -c "import faster_whisper; print('ok')" 2>$null) | Select-Object -Last 1
+    $checkWhisper = "$checkWhisper".Trim()
+    Write-Host "[ClaudePlus] Import check faster-whisper: '$checkWhisper'" -ForegroundColor DarkGray
+    if ($checkWhisper -ne "ok") {
+        Write-Host "[ClaudePlus] Installation de faster-whisper (premiere fois)..." -ForegroundColor Yellow
+
+        # Try with --break-system-packages first (Python 3.11+), then without
+        $pipResult = & $py -m pip install faster-whisper --break-system-packages 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ClaudePlus] Retry sans --break-system-packages..." -ForegroundColor DarkGray
+            $pipResult = & $py -m pip install faster-whisper 2>&1
+        }
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ClaudePlus] Pip output: $($pipResult | Out-String)" -ForegroundColor DarkGray
+            Write-Host "[ClaudePlus] WARN: faster-whisper echoue, essai openai-whisper..." -ForegroundColor Yellow
+            $pipResult = & $py -m pip install openai-whisper 2>&1
+        }
+
+        # Verify import
+        $checkWhisper = (& $py -c "import faster_whisper; print('ok')" 2>$null) | Select-Object -Last 1
+        $checkWhisper = "$checkWhisper".Trim()
+        if ($checkWhisper -ne "ok") {
+            # Check if openai-whisper was installed instead
+            $checkOpenai = (& $py -c "import whisper; print('ok')" 2>$null) | Select-Object -Last 1
+            $checkOpenai = "$checkOpenai".Trim()
+            if ($checkOpenai -eq "ok") {
+                $script:WhisperBackend = "openai"
+                Write-Host "[ClaudePlus] openai-whisper OK (fallback)" -ForegroundColor DarkGray
+            } else {
+                Write-Host "[ClaudePlus] Pip output: $($pipResult | Out-String)" -ForegroundColor Red
+                Write-Host "[ClaudePlus] ERREUR: Impossible d'installer whisper. Vocal desactive." -ForegroundColor Red
+                Write-Host "[ClaudePlus] Essayez manuellement: $py -m pip install faster-whisper" -ForegroundColor Yellow
+                return $false
+            }
+        } else {
+            $script:WhisperBackend = "faster"
+        }
+    } else {
+        $script:WhisperBackend = "faster"
+    }
+    Write-Host "[ClaudePlus] Whisper OK (backend: $($script:WhisperBackend))" -ForegroundColor DarkGray
+
+    # Check ffmpeg (needed to decode OGG Opus from Telegram)
+    $ffmpegOk = $false
+    try {
+        $ffVer = & ffmpeg -version 2>&1
+        if ($ffVer -match "ffmpeg") { $ffmpegOk = $true }
+    } catch { }
+
+    if (-not $ffmpegOk) {
+        Write-Host "[ClaudePlus] Installation de ffmpeg via winget..." -ForegroundColor Yellow
+        try {
+            & winget install Gyan.FFmpeg --accept-source-agreements --accept-package-agreements -q 2>&1 | Out-Null
+            # Refresh PATH
+            $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+            $ffVer = & ffmpeg -version 2>&1
+            if ($ffVer -match "ffmpeg") { $ffmpegOk = $true }
+        } catch { }
+    }
+
+    if (-not $ffmpegOk) {
+        Write-Host "[ClaudePlus] WARN: ffmpeg non trouve. Certains formats audio peuvent echouer." -ForegroundColor Yellow
+        Write-Host "[ClaudePlus] Installez ffmpeg: winget install Gyan.FFmpeg" -ForegroundColor Yellow
+    } else {
+        Write-Host "[ClaudePlus] ffmpeg OK" -ForegroundColor DarkGray
+    }
+
+    $script:PythonCmd = $py
+    $script:TranscriptionReady = $true
+
+    # Create the transcription Python script (supports both backends)
+    $script:TranscribeScript = "$env:TEMP\claudeplus_transcribe.py"
+    $pyCode = @'
+import sys, json, os
+
+audio_path = sys.argv[1]
+model_size = sys.argv[2] if len(sys.argv) > 2 else "base"
+backend = sys.argv[3] if len(sys.argv) > 3 else "faster"
+
+if backend == "faster":
+    from faster_whisper import WhisperModel
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    segments, info = model.transcribe(audio_path, beam_size=5)
+    text = " ".join([s.text.strip() for s in segments])
+    result = {"text": text, "language": info.language, "probability": round(info.language_probability, 2)}
+else:
+    import whisper
+    model = whisper.load_model(model_size)
+    out = model.transcribe(audio_path)
+    result = {"text": out["text"].strip(), "language": out.get("language", "?"), "probability": 0.99}
+
+print(json.dumps(result, ensure_ascii=False))
+'@
+    [System.IO.File]::WriteAllText($script:TranscribeScript, $pyCode, [System.Text.Encoding]::UTF8)
+
+    Write-Host "[ClaudePlus] Transcription vocale prete (auto-detection langue, 99+ langues)" -ForegroundColor Green
+    return $true
+}
+
+function Transcribe-TelegramAudio {
+    param(
+        [string]$FileId,
+        [string]$Token,
+        [string]$ModelSize = "base"
+    )
+
+    if (-not $script:TranscriptionReady) {
+        Write-Host "[ClaudePlus] Transcription non initialisee" -ForegroundColor Red
+        return $null
+    }
+
+    try {
+        # Step 1: Get file path from Telegram
+        $fileInfo = Invoke-RestMethod -Uri "https://api.telegram.org/bot$Token/getFile?file_id=$FileId" -Method Get -TimeoutSec 10
+        if (-not $fileInfo.ok) {
+            Write-Host "[ClaudePlus] Erreur getFile Telegram" -ForegroundColor Red
+            return $null
+        }
+        $filePath = $fileInfo.result.file_path
+
+        # Step 2: Download audio file
+        $audioFile = "$env:TEMP\claudeplus_voice_$(Get-Random).ogg"
+        $downloadUrl = "https://api.telegram.org/file/bot$Token/$filePath"
+        Write-Host "[ClaudePlus] Telechargement audio: $filePath" -ForegroundColor DarkGray
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $audioFile -TimeoutSec 30 -ErrorAction Stop
+
+        if (-not (Test-Path $audioFile) -or (Get-Item $audioFile).Length -lt 100) {
+            Write-Host "[ClaudePlus] Fichier audio invalide" -ForegroundColor Red
+            return $null
+        }
+
+        $fileSize = [Math]::Round((Get-Item $audioFile).Length / 1024, 1)
+        Write-Host "[ClaudePlus] Audio telecharge ($fileSize KB), transcription en cours..." -ForegroundColor DarkCyan
+
+        # Step 3: Transcribe with faster-whisper
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $script:PythonCmd
+        $backend = if ($script:WhisperBackend) { $script:WhisperBackend } else { "faster" }
+        $psi.Arguments = "`"$($script:TranscribeScript)`" `"$audioFile`" `"$ModelSize`" `"$backend`""
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        $exited = $proc.WaitForExit(120000)
+
+        if (-not $exited) {
+            try { $proc.Kill() } catch { }
+            Write-Host "[ClaudePlus] Transcription timeout (2min)" -ForegroundColor Yellow
+            return $null
+        }
+
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+
+        # Cleanup audio file
+        Remove-Item $audioFile -ErrorAction SilentlyContinue
+
+        if ($proc.ExitCode -ne 0 -or [string]::IsNullOrEmpty($stdout)) {
+            Write-Host "[ClaudePlus] Erreur transcription: $stderr" -ForegroundColor Red
+            return $null
+        }
+
+        # Parse JSON result
+        $result = $stdout.Trim() | ConvertFrom-Json
+        Write-Host "[ClaudePlus] Transcription OK: [$($result.language) $($result.probability * 100)%] $($result.text)" -ForegroundColor Green
+        return $result
+
+    } catch {
+        Write-Host "[ClaudePlus] Erreur transcription: $_" -ForegroundColor Red
+        return $null
+    }
+}
+
+# ============================================================================
 # FIND CHILD CMD.EXE PID
 # ============================================================================
 
@@ -462,120 +842,206 @@ function Get-WindowHandleForPid {
 }
 
 # ============================================================================
-# SEND TEXT TO CLAUDE WINDOW
+# ============================================================================
+# PIPE MODE: Send message via 'claude -p' and capture clean stdout response
+# No TUI, no buffer reading, no cursor artifacts, no size limit.
+# Uses --continue to maintain conversation context across messages.
+# ============================================================================
+
+function Invoke-ClaudePipe {
+    param(
+        [string]$Message,
+        [string]$ClaudePath,
+        [string]$WorkDir,
+        [switch]$Continue,
+        [switch]$DangerouslySkipPermissions
+    )
+
+    # Write message to temp file to avoid shell escaping issues
+    $msgFile = "$env:TEMP\claudeplus_msg.txt"
+    [System.IO.File]::WriteAllText($msgFile, $Message, [System.Text.Encoding]::UTF8)
+
+    # Build argument list -- message passed as argument in quotes
+    # Escape inner double quotes for command line
+    $escapedMsg = $Message -replace '"', '\"'
+    $argList = @("-p", "`"$escapedMsg`"")
+    if ($Continue) { $argList += "--continue" }
+    if ($DangerouslySkipPermissions) { $argList += "--dangerously-skip-permissions" }
+    $argStr = $argList -join " "
+
+    Write-Host "[ClaudePlus] Pipe: claude -p `"$Message`" $(if($Continue){'--continue '})$(if($DangerouslySkipPermissions){'--skip-perms'})" -ForegroundColor DarkCyan
+
+    # Use a temp file for output to avoid stdout blocking issues
+    $outFile = "$env:TEMP\claudeplus_pipe_out.txt"
+    $errFile = "$env:TEMP\claudeplus_pipe_err.txt"
+    Remove-Item $outFile -ErrorAction SilentlyContinue
+    Remove-Item $errFile -ErrorAction SilentlyContinue
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $ClaudePath
+        $psi.Arguments = $argStr
+        $psi.WorkingDirectory = $WorkDir
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+        Write-Host "[ClaudePlus] Pipe: lancement..." -ForegroundColor DarkGray
+        $proc = [System.Diagnostics.Process]::Start($psi)
+
+        # Read both streams async to prevent deadlock
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        # Wait with timeout (3 minutes max)
+        $exited = $proc.WaitForExit(180000)
+
+        if (-not $exited) {
+            Write-Host "[ClaudePlus] Pipe: timeout 3min, kill" -ForegroundColor Yellow
+            try { $proc.Kill() } catch { }
+            return $null
+        }
+
+        $exitCode = $proc.ExitCode
+        $output = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+
+        Write-Host "[ClaudePlus] Pipe: exit=$exitCode stdout=$($output.Length) stderr=$($stderr.Length)" -ForegroundColor DarkGray
+
+        if ($stderr -and $stderr.Trim().Length -gt 0) {
+            $stderrPreview = $stderr.Substring(0, [Math]::Min(300, $stderr.Length))
+            Write-Host "[ClaudePlus] Pipe stderr: $stderrPreview" -ForegroundColor DarkGray
+        }
+
+        $result = $output.Trim()
+        if ($result.Length -gt 0) {
+            Write-Host "[ClaudePlus] Pipe: reponse OK ($($result.Length) chars)" -ForegroundColor Green
+            return $result
+        } else {
+            Write-Host "[ClaudePlus] Pipe: reponse vide (exit=$exitCode)" -ForegroundColor Yellow
+            # If stdout empty, maybe response is in stderr?
+            if ($stderr -and $stderr.Trim().Length -gt 10) {
+                return $stderr.Trim()
+            }
+            return $null
+        }
+    } catch {
+        Write-Host "[ClaudePlus] Pipe erreur: $_" -ForegroundColor Red
+        return $null
+    }
+}
+
+# ============================================================================
+# SEND TEXT TO CLAUDE WINDOW (legacy - used for TUI terminal mode)
 # Uses: MainWindowHandle + SetForegroundWindow + WshShell.SendKeys
 # ============================================================================
 
 function Send-TextToClaude {
     param([string]$Text)
 
-    # Find cmd PID if not set
-    if ($script:ClaudeCmdPid -eq 0 -and $script:ClaudeProcess -and -not $script:ClaudeProcess.HasExited) {
-        $script:ClaudeCmdPid = Find-ChildCmdPid -ParentPid $script:ClaudeProcess.Id
+    # Find window handle if needed
+    if (-not $script:ClaudeWindowHandle -or $script:ClaudeWindowHandle -eq [IntPtr]::Zero) {
         if ($script:ClaudeCmdPid -gt 0) {
-            Write-Host "[ClaudePlus] cmd.exe PID: $($script:ClaudeCmdPid)" -ForegroundColor DarkGray
+            $script:ClaudeWindowHandle = Get-WindowHandleForPid -Pid1 $script:ClaudeCmdPid
         }
     }
 
-    if ($script:ClaudeCmdPid -le 0) {
-        Write-Host "[ClaudePlus] ERREUR: cmd.exe PID introuvable" -ForegroundColor Red
+    $hwnd = $script:ClaudeWindowHandle
+    if (-not $hwnd -or $hwnd -eq [IntPtr]::Zero) {
+        Write-Host "[ClaudePlus] ERREUR: Handle fenetre introuvable" -ForegroundColor Red
         return $false
     }
 
-    # WriteConsoleInput via helper process (separate process to avoid FreeConsole on our console)
-    # C# code in separate .cs file to avoid nested here-string issues
-    Write-Host "[ClaudePlus] Envoi via WriteConsoleInput (helper) vers PID $($script:ClaudeCmdPid)..." -ForegroundColor DarkGray
+    Write-Host "[ClaudePlus] Envoi via PostMessage WM_CHAR vers hwnd=$hwnd..." -ForegroundColor DarkGray
 
     try {
-        # 1. Write C# source file
-        $csFile = "$env:TEMP\claudeplus_conwriter.cs"
-        $csCode = "using System;" + [Environment]::NewLine
-        $csCode += "using System.Runtime.InteropServices;" + [Environment]::NewLine
-        $csCode += "using System.Threading;" + [Environment]::NewLine
-        $csCode += "public class ConW {" + [Environment]::NewLine
-        $csCode += "    [DllImport(`"kernel32.dll`", SetLastError=true)] public static extern bool FreeConsole();" + [Environment]::NewLine
-        $csCode += "    [DllImport(`"kernel32.dll`", SetLastError=true)] public static extern bool AttachConsole(int pid);" + [Environment]::NewLine
-        $csCode += "    [DllImport(`"kernel32.dll`", SetLastError=true)] public static extern IntPtr GetStdHandle(int h);" + [Environment]::NewLine
-        $csCode += "    [DllImport(`"kernel32.dll`", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool WriteConsoleInput(IntPtr hIn, INPUT_RECORD[] buf, uint len, out uint written);" + [Environment]::NewLine
-        $csCode += "    [DllImport(`"kernel32.dll`")] public static extern int GetLastError();" + [Environment]::NewLine
-        $csCode += "    public const int STD_INPUT_HANDLE = -10;" + [Environment]::NewLine
-        $csCode += "    public const ushort KEY_EVENT = 0x0001;" + [Environment]::NewLine
-        $csCode += "    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]" + [Environment]::NewLine
-        $csCode += "    public struct KEY_EVENT_RECORD { public bool bKeyDown; public ushort wRepeatCount; public ushort wVirtualKeyCode; public ushort wVirtualScanCode; public char UnicodeChar; public uint dwControlKeyState; }" + [Environment]::NewLine
-        $csCode += "    [StructLayout(LayoutKind.Explicit, CharSet=CharSet.Unicode)]" + [Environment]::NewLine
-        $csCode += "    public struct INPUT_RECORD { [FieldOffset(0)] public ushort EventType; [FieldOffset(4)] public KEY_EVENT_RECORD KeyEvent; }" + [Environment]::NewLine
-        $csCode += "    public static string Write(int pid, string text) {" + [Environment]::NewLine
-        $csCode += "        FreeConsole();" + [Environment]::NewLine
-        $csCode += "        if (!AttachConsole(pid)) return `"FAIL:Attach err=`" + GetLastError();" + [Environment]::NewLine
-        $csCode += "        try {" + [Environment]::NewLine
-        $csCode += "            IntPtr h = GetStdHandle(STD_INPUT_HANDLE);" + [Environment]::NewLine
-        $csCode += "            if (h == IntPtr.Zero || h == new IntPtr(-1)) return `"FAIL:Handle`";" + [Environment]::NewLine
-        $csCode += "            int n = 0;" + [Environment]::NewLine
-        $csCode += "            foreach (char c in text) {" + [Environment]::NewLine
-        $csCode += "                INPUT_RECORD[] r = new INPUT_RECORD[2];" + [Environment]::NewLine
-        $csCode += "                r[0].EventType = KEY_EVENT; r[0].KeyEvent.bKeyDown = true; r[0].KeyEvent.wRepeatCount = 1; r[0].KeyEvent.UnicodeChar = c;" + [Environment]::NewLine
-        $csCode += "                r[1] = r[0]; r[1].KeyEvent.bKeyDown = false;" + [Environment]::NewLine
-        $csCode += "                uint w; if (!WriteConsoleInput(h, r, 2, out w)) return `"FAIL:Write n=`" + n;" + [Environment]::NewLine
-        $csCode += "                n++; Thread.Sleep(15);" + [Environment]::NewLine
-        $csCode += "            }" + [Environment]::NewLine
-        $csCode += "            Thread.Sleep(100);" + [Environment]::NewLine
-        $csCode += "            INPUT_RECORD[] e = new INPUT_RECORD[2];" + [Environment]::NewLine
-        $csCode += "            e[0].EventType = KEY_EVENT; e[0].KeyEvent.bKeyDown = true; e[0].KeyEvent.wRepeatCount = 1; e[0].KeyEvent.wVirtualKeyCode = 0x0D; e[0].KeyEvent.UnicodeChar = (char)13;" + [Environment]::NewLine
-        $csCode += "            e[1] = e[0]; e[1].KeyEvent.bKeyDown = false;" + [Environment]::NewLine
-        $csCode += "            uint ew; WriteConsoleInput(h, e, 2, out ew);" + [Environment]::NewLine
-        $csCode += "            return `"OK:sent=`" + n;" + [Environment]::NewLine
-        $csCode += "        } finally { FreeConsole(); }" + [Environment]::NewLine
-        $csCode += "    }" + [Environment]::NewLine
-        $csCode += "}" + [Environment]::NewLine
-        [System.IO.File]::WriteAllText($csFile, $csCode, [System.Text.Encoding]::ASCII)
-
-        # 2. Write helper PS1 that uses the .cs file
-        $helperScript = "$env:TEMP\claudeplus_writer.ps1"
-        $helperLines = @()
-        $helperLines += 'param([int]$TargetPid, [string]$TextFile, [string]$CsFile)'
-        $helperLines += 'try {'
-        $helperLines += '    $text = [System.IO.File]::ReadAllText($TextFile, [System.Text.Encoding]::UTF8)'
-        $helperLines += '    Add-Type -Path $CsFile'
-        $helperLines += '    $result = [ConW]::Write($TargetPid, $text)'
-        $helperLines += '    [System.IO.File]::WriteAllText("$TextFile.log", "Result=$result")'
-        $helperLines += '    if ($result.StartsWith("OK")) { [System.IO.File]::WriteAllText("$TextFile.ok", $result) }'
-        $helperLines += '} catch {'
-        $helperLines += '    [System.IO.File]::WriteAllText("$TextFile.log", "EXCEPTION: $_")'
-        $helperLines += '}'
-        $helperContent = $helperLines -join "`r`n"
-        [System.IO.File]::WriteAllText($helperScript, $helperContent, [System.Text.Encoding]::ASCII)
-
-        # 3. Write text to temp file and run helper
+        # PostMessage WM_CHAR approach -- no AttachConsole needed, works with conhost.exe windows
+        # Builds a C# helper that posts chars directly to the window message queue
+        $csFile = "$env:TEMP\claudeplus_poster.cs"
+        $csCode = @"
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+public class ConPoster {
+    const uint WM_CHAR    = 0x0102;
+    const uint WM_KEYDOWN = 0x0100;
+    const uint WM_KEYUP   = 0x0101;
+    const int  VK_RETURN  = 0x0D;
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int cmd);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr pid);
+    [DllImport("user32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    public static string Send(long hwnd, string text) {
+        var h = new IntPtr(hwnd);
+        // Bring window to foreground using AttachThreadInput trick
+        try {
+            ShowWindow(h, 9); // SW_RESTORE
+            BringWindowToTop(h);
+            uint wndThread = GetWindowThreadProcessId(h, IntPtr.Zero);
+            uint curThread = GetCurrentThreadId();
+            AttachThreadInput(curThread, wndThread, true);
+            SetForegroundWindow(h);
+            AttachThreadInput(curThread, wndThread, false);
+        } catch {}
+        Thread.Sleep(400);
+        // Send each character via WM_CHAR
+        int n = 0;
+        foreach (char c in text) {
+            PostMessage(h, WM_CHAR, (IntPtr)c, (IntPtr)1);
+            Thread.Sleep(30);
+            n++;
+        }
+        Thread.Sleep(150);
+        // Send Enter
+        PostMessage(h, WM_KEYDOWN, (IntPtr)VK_RETURN, (IntPtr)1);
+        Thread.Sleep(30);
+        PostMessage(h, WM_KEYUP,   (IntPtr)VK_RETURN, (IntPtr)1);
+        return "OK:sent=" + n;
+    }
+}
+"@
         $textFile = "$env:TEMP\claudeplus_sendtext.txt"
-        $okFile = "$textFile.ok"
-        $logFile = "$textFile.log"
-        if (Test-Path $okFile) { Remove-Item $okFile -ErrorAction SilentlyContinue }
-        if (Test-Path $logFile) { Remove-Item $logFile -ErrorAction SilentlyContinue }
+        $logFile  = "$textFile.log"
+        [System.IO.File]::WriteAllText($csFile, $csCode, [System.Text.Encoding]::UTF8)
         [System.IO.File]::WriteAllText($textFile, $Text, [System.Text.Encoding]::UTF8)
+        if (Test-Path $logFile) { Remove-Item $logFile -ErrorAction SilentlyContinue }
 
-        $proc = Start-Process -FilePath "powershell.exe" `
-            -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$helperScript`" -TargetPid $($script:ClaudeCmdPid) -TextFile `"$textFile`" -CsFile `"$csFile`"" `
-            -PassThru -WindowStyle Hidden
+        $hwndLong = [long]$hwnd
+        $helperScript = "$env:TEMP\claudeplus_poster.ps1"
+        $helperLines = @(
+            'param([long]$Hwnd, [string]$TextFile, [string]$CsFile, [string]$LogFile)',
+            'try {',
+            '    $text = [System.IO.File]::ReadAllText($TextFile, [System.Text.Encoding]::UTF8)',
+            '    Add-Type -Path $CsFile -ErrorAction Stop',
+            '    $result = [ConPoster]::Send($Hwnd, $text)',
+            '    [System.IO.File]::WriteAllText($LogFile, "Result=$result")',
+            '} catch {',
+            '    [System.IO.File]::WriteAllText($LogFile, "EXCEPTION: $_")',
+            '}'
+        )
+        [System.IO.File]::WriteAllText($helperScript, ($helperLines -join "`r`n"), [System.Text.Encoding]::UTF8)
+
+        $argStr = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$helperScript`" -Hwnd $hwndLong -TextFile `"$textFile`" -CsFile `"$csFile`" -LogFile `"$logFile`""
+        $proc = Start-Process -FilePath "powershell.exe" -ArgumentList $argStr -PassThru -WindowStyle Hidden
         $proc.WaitForExit(15000) | Out-Null
         if (-not $proc.HasExited) { $proc.Kill() }
 
-        # Read log for debug
         if (Test-Path $logFile) {
             $logContent = [System.IO.File]::ReadAllText($logFile)
-            Write-Host "[ClaudePlus] Helper log: $logContent" -ForegroundColor DarkGray
+            Write-Host "[ClaudePlus] Send result: $logContent" -ForegroundColor DarkGray
+            Remove-Item $logFile -ErrorAction SilentlyContinue
+            if ($logContent -match "^Result=OK") { return $true }
         } else {
-            Write-Host "[ClaudePlus] Pas de log helper (process crash?)" -ForegroundColor Red
+            Write-Host "[ClaudePlus] Pas de log (process crash?)" -ForegroundColor Red
         }
-
-        if (Test-Path $okFile) {
-            $okContent = [System.IO.File]::ReadAllText($okFile)
-            Write-Host "[ClaudePlus] Texte envoye! ($okContent)" -ForegroundColor Green
-            Remove-Item $okFile -ErrorAction SilentlyContinue
-            return $true
-        }
-        Write-Host "[ClaudePlus] Helper process echoue" -ForegroundColor Red
     } catch {
-        Write-Host "[ClaudePlus] Erreur helper: $_" -ForegroundColor Red
+        Write-Host "[ClaudePlus] Erreur send: $_" -ForegroundColor Red
     }
 
     return $false
@@ -622,6 +1088,13 @@ function Invoke-ClaudePlus {
 
     if ($useTelegram) {
         Write-Host "[ClaudePlus] Mode Mirror Telegram actif." -ForegroundColor Green
+
+        # RESET all state from previous session
+        $script:ClaudeProcess = $null
+        $script:ClaudeCmdPid = 0
+        $script:ClaudeWindowHandle = [IntPtr]::Zero
+        $script:LastConsoleText = ""
+        $script:PipeMessageCount = 0
 
         Delete-TelegramWebhook -Token $config.TelegramBotToken
 
@@ -682,8 +1155,9 @@ function Invoke-ClaudePlus {
                         $wmi = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue
                         if ($wmi -and [int]$wmi.ParentProcessId -eq $script:ClaudeProcess.Id) {
                             $script:ClaudeCmdPid = $_.Id
+                            $script:ClaudeWindowHandle = $_.MainWindowHandle
                             $found = $true
-                            Write-Host "[ClaudePlus] FENETRE TROUVEE via scan! PID=$($_.Id)" -ForegroundColor Green
+                            Write-Host "[ClaudePlus] FENETRE TROUVEE via scan! PID=$($_.Id) Handle=$($_.MainWindowHandle)" -ForegroundColor Green
                         }
                     } catch { }
                 }
@@ -694,24 +1168,20 @@ function Invoke-ClaudePlus {
             Write-Host "[ClaudePlus] ATTENTION: Pas de handle fenetre. Le mirror peut echouer." -ForegroundColor Red
         }
 
-        Send-TelegramMessage -Message "ClaudePlus demarre! Envoyez vos messages.`n/stop pour arreter." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
-
-        # Initialize console buffer reader
-        Initialize-ConsoleReader
-        $script:LastConsoleText = ""
-
-        # Do initial baseline read
-        if ($script:ClaudeCmdPid -gt 0) {
-            $initialText = Read-ClaudeConsole -CmdPid $script:ClaudeCmdPid
-            if ($initialText) {
-                $script:LastConsoleText = $initialText
-                Write-Host "[ClaudePlus] Console baseline OK ($($initialText.Length) chars)" -ForegroundColor Green
-            } else {
-                Write-Host "[ClaudePlus] WARN: Lecture console echouee (retry plus tard)" -ForegroundColor Yellow
-            }
+        # Initialize voice transcription (Python + faster-whisper + ffmpeg)
+        $voiceOk = Initialize-Transcription
+        if ($voiceOk) {
+            Send-TelegramMessage -Message "ClaudePlus demarre! Envoyez vos messages (texte ou vocal).`n/stop pour arreter." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+        } else {
+            Send-TelegramMessage -Message "ClaudePlus demarre! Envoyez vos messages texte.`n(Vocal desactive - Python/faster-whisper manquant)`n/stop pour arreter." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
         }
 
-        # Telegram polling loop (response captured after each send)
+        # Wait for Claude TUI to start in the visible terminal
+        Write-Host "[ClaudePlus] Attente demarrage Claude TUI (3s)..." -ForegroundColor DarkGray
+        Start-Sleep -Seconds 3
+
+        # Telegram polling loop -- uses pipe mode (claude -p) for clean responses
+        Write-Host "[ClaudePlus] Mode PIPE actif: les messages Telegram passent par 'claude -p' (pas par le terminal)" -ForegroundColor Cyan
         Write-Host "[ClaudePlus] Polling Telegram... (Ctrl+C pour arreter)" -ForegroundColor Green
         Write-Host ""
 
@@ -728,11 +1198,13 @@ function Invoke-ClaudePlus {
 
         $stopRequested = $false
         $waitingForResponse = $false
+        $pollCount = 0
 
         try {
             while (-not $stopRequested) {
+                $pollCount++
                 # Check if conhost or cmd.exe has exited
-                if ($script:ClaudeProcess.HasExited) { break }
+                if ($script:ClaudeProcess.HasExited) { Write-Host "[ClaudePlus] conhost a quitte." -ForegroundColor Yellow; break }
                 if ($script:ClaudeCmdPid -gt 0) {
                     $cmdProc = Get-Process -Id $script:ClaudeCmdPid -ErrorAction SilentlyContinue
                     if (-not $cmdProc) { Write-Host "[ClaudePlus] cmd.exe termine, arret." -ForegroundColor Yellow; break }
@@ -742,15 +1214,56 @@ function Invoke-ClaudePlus {
                 try {
                     $url = "https://api.telegram.org/bot$($config.TelegramBotToken)/getUpdates?limit=10&timeout=2"
                     if ($lastUpdateId -gt 0) { $url += "&offset=$($lastUpdateId + 1)" }
+                    if ($pollCount % 10 -eq 1) {
+                        Write-Host "[ClaudePlus] Telegram poll #$pollCount (offset=$lastUpdateId, hwnd=$($script:ClaudeWindowHandle))" -ForegroundColor DarkGray
+                    }
                     $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 5 -ErrorAction Stop
 
                     if ($response.ok -and $response.result) {
                         foreach ($update in $response.result) {
                             if ($update.update_id -gt $lastUpdateId) { $lastUpdateId = $update.update_id }
                             $msg = $update.message
-                            if (-not $msg -or [string]::IsNullOrEmpty($msg.text)) { continue }
+                            if (-not $msg) { continue }
                             if ($msg.chat.id -ne [long]$config.TelegramChatId) { continue }
-                            $text = $msg.text.Trim()
+
+                            # Determine message type: text or voice
+                            $text = $null
+                            $isVoice = $false
+
+                            if ($msg.voice -or $msg.audio) {
+                                # Voice message or audio file
+                                $isVoice = $true
+                                $fileId = if ($msg.voice) { $msg.voice.file_id } else { $msg.audio.file_id }
+                                $duration = if ($msg.voice) { $msg.voice.duration } else { $msg.audio.duration }
+
+                                if (-not $script:TranscriptionReady) {
+                                    Send-TelegramMessage -Message "[Vocal non supporte - Python/faster-whisper manquant]" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                    continue
+                                }
+
+                                Write-Host ""
+                                Write-Host "  >> [Vocal ${duration}s] Transcription..." -ForegroundColor DarkCyan
+                                Send-TelegramMessage -Message "[Transcription en cours...]" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+
+                                $transcription = Transcribe-TelegramAudio -FileId $fileId -Token $config.TelegramBotToken
+                                if (-not $transcription -or [string]::IsNullOrEmpty($transcription.text)) {
+                                    Send-TelegramMessage -Message "[Erreur transcription - audio non reconnu]" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                    continue
+                                }
+
+                                $text = $transcription.text.Trim()
+                                $lang = $transcription.language
+                                $conf = [int]($transcription.probability * 100)
+                                Write-Host "  >> [Vocal -> $lang ${conf}%] $text" -ForegroundColor Cyan
+                                Send-TelegramMessage -Message "[Transcription ($lang ${conf}%)]: $text" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+
+                            } elseif (-not [string]::IsNullOrEmpty($msg.text)) {
+                                $text = $msg.text.Trim()
+                            } else {
+                                continue
+                            }
+
+                            if (-not $text -or $text.Length -eq 0) { continue }
 
                             if ($text -match "^/stop") {
                                 Send-TelegramMessage -Message "Mirror arrete." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
@@ -764,37 +1277,42 @@ function Invoke-ClaudePlus {
                                 continue
                             }
 
-                            Write-Host "[Telegram -> Claude] $text" -ForegroundColor Cyan
+                            if (-not $isVoice) {
+                                Write-Host ""
+                                Write-Host "  >> $text" -ForegroundColor Cyan
+                            }
 
-                            # Capture baseline BEFORE sending
-                            $preBaseline = Read-ClaudeConsole -CmdPid $script:ClaudeCmdPid
-                            if (-not $preBaseline) { $preBaseline = $script:LastConsoleText }
+                            $waitingForResponse = $true
 
-                            $sent = Send-TextToClaude -Text $text
+                            # HYBRID: also send to TUI terminal for visual display
+                            Send-TextToClaude -Text $text | Out-Null
 
-                            if ($sent) {
-                                Write-Host "[ClaudePlus] Message envoye, attente reponse..." -ForegroundColor DarkGray
-                                $waitingForResponse = $true
+                            # Use pipe mode for clean response capture
+                            $useSkip = ($config.DangerouslySkipPermissions -eq $true)
+                            $responseText = Invoke-ClaudePipe `
+                                -Message $text `
+                                -ClaudePath $claudePath `
+                                -WorkDir $workDir `
+                                -Continue:($script:PipeMessageCount -gt 0) `
+                                -DangerouslySkipPermissions:$useSkip
 
-                                # Wait for Claude to finish responding (blocking)
-                                # Pass the PRE-SEND baseline so we detect any change
-                                $responseText = Wait-ClaudeResponse -CmdPid $script:ClaudeCmdPid -BaselineRaw $preBaseline -MaxWaitSec 120
+                            $script:PipeMessageCount++
+                            $waitingForResponse = $false
 
-                                $waitingForResponse = $false
+                            if ($responseText -and $responseText.Length -gt 3) {
+                                # Show response in PS console
+                                Write-Host "  << $responseText" -ForegroundColor Green
+                                Write-Host ""
 
-                                if ($responseText -and $responseText.Length -gt 3) {
-                                    # Truncate if too long for Telegram
-                                    if ($responseText.Length -gt 3500) {
-                                        $responseText = $responseText.Substring(0, 3500) + "`n[... tronque]"
-                                    }
-                                    Write-Host "[Claude -> Telegram] $($responseText.Length) chars" -ForegroundColor Magenta
-                                    Send-TelegramMessage -Message $responseText -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
-                                } else {
-                                    Write-Host "[ClaudePlus] Pas de reponse detectee (timeout ou vide)" -ForegroundColor Yellow
-                                    Send-TelegramMessage -Message "[Pas de reponse detectee - verifiez le terminal]" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                # Truncate if too long for Telegram (4096 char limit)
+                                if ($responseText.Length -gt 3900) {
+                                    $responseText = $responseText.Substring(0, 3900) + "`n[... tronque]"
                                 }
+                                Send-TelegramMessage -Message $responseText -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                             } else {
-                                Send-TelegramMessage -Message "[ERREUR] Fenetre Claude introuvable" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                Write-Host "  << [pas de reponse]" -ForegroundColor Yellow
+                                Write-Host ""
+                                Send-TelegramMessage -Message "[Pas de reponse - verifiez le terminal]" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                             }
                         }
                     }
@@ -807,7 +1325,7 @@ function Invoke-ClaudePlus {
         finally {
             Send-TelegramMessage -Message "ClaudePlus terminee." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
             if (Test-Path $batPath) { Remove-Item $batPath -ErrorAction SilentlyContinue }
-            if ($script:ConsoleReaderScript -and (Test-Path $script:ConsoleReaderScript)) { Remove-Item $script:ConsoleReaderScript -ErrorAction SilentlyContinue }
+            # ConsoleReaderScript no longer used (switched to WM_SYSCOMMAND approach)
             Write-Host ""
             Write-Host "[ClaudePlus] Session terminee." -ForegroundColor DarkCyan
         }
