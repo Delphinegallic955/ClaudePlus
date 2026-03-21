@@ -900,12 +900,12 @@ function Invoke-ClaudePipe {
         $debugLogFile = "$env:TEMP\claudeplus_stream_debug.log"
         Remove-Item $debugLogFile -ErrorAction SilentlyContinue
 
-        # Emoji map for tool types
+        # Symbol map for tool types (BMP chars only — PS 5.x [char] is 16-bit, no emoji > 0xFFFF)
         $toolEmojis = @{
-            "Read" = [char]0x1F4D6; "Write" = [char]0x270F; "Edit" = [char]0x2702
-            "Bash" = [char]0x2699; "Grep" = [char]0x1F50D; "Glob" = [char]0x1F4C2
-            "Search" = [char]0x1F50E; "Agent" = [char]0x1F916; "Explore" = [char]0x1F9ED
-            "TodoWrite" = [char]0x1F4DD; "WebSearch" = [char]0x1F310; "WebFetch" = [char]0x1F310
+            "Read" = [char]0x25B6; "Write" = [char]0x270F; "Edit" = [char]0x2702
+            "Bash" = [char]0x2699; "Grep" = [char]0x25C6; "Glob" = [char]0x25A0
+            "Search" = [char]0x25C6; "Agent" = [char]0x25B7; "Explore" = [char]0x25CB
+            "TodoWrite" = [char]0x25AA; "WebSearch" = [char]0x25C8; "WebFetch" = [char]0x25C8
         }
 
         # Helper: recursively find tool names and text in any JSON structure
@@ -1602,7 +1602,7 @@ function Invoke-ClaudePlus {
 
         # Build startup message with session info
         $startupLines = @()
-        $startupLines += "$([char]0x1F680) @$Name demarre!"
+        $startupLines += "$([char]0x25BA) @$Name demarre!"
         $startupLines += "Dossier: $(Split-Path -Leaf $workDir)"
         if ($sessionCount -gt 1) {
             $otherNames = ($activeSessions | Where-Object { $_.Pid -ne $PID } | ForEach-Object { "@$($_.Name)" }) -join ", "
@@ -1645,11 +1645,37 @@ function Invoke-ClaudePlus {
         try {
             while (-not $stopRequested) {
                 $pollCount++
-                # Check if conhost or cmd.exe has exited
-                if ($script:ClaudeProcess.HasExited) { Write-Host "[ClaudePlus] conhost a quitte." -ForegroundColor Yellow; break }
-                if ($script:ClaudeCmdPid -gt 0) {
-                    $cmdProc = Get-Process -Id $script:ClaudeCmdPid -ErrorAction SilentlyContinue
-                    if (-not $cmdProc) { Write-Host "[ClaudePlus] cmd.exe termine, arret." -ForegroundColor Yellow; break }
+                # Check if Claude is still running
+                # With Windows Terminal, wt.exe exits immediately (delegates to existing WT instance)
+                # So we check the cmd.exe child or the WT window instead
+                if ($script:UsesWindowsTerminal) {
+                    # For WT: check if the window still exists or if cmd.exe child is alive
+                    $wtAlive = $false
+                    if ($script:ClaudeWindowHandle -ne [IntPtr]::Zero) {
+                        # Check if window handle is still valid
+                        $wtProc = Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -eq $script:ClaudeWindowHandle }
+                        if ($wtProc) { $wtAlive = $true }
+                    }
+                    if (-not $wtAlive -and $script:ClaudeCmdPid -gt 0) {
+                        $cmdProc = Get-Process -Id $script:ClaudeCmdPid -ErrorAction SilentlyContinue
+                        if ($cmdProc) { $wtAlive = $true }
+                    }
+                    if (-not $wtAlive) {
+                        # WT window might still exist with a different handle, check any WT
+                        $anyWt = Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue
+                        if ($anyWt) { $wtAlive = $true }
+                    }
+                    if (-not $wtAlive) {
+                        Write-Host "[ClaudePlus] Windows Terminal ferme, arret." -ForegroundColor Yellow
+                        break
+                    }
+                } else {
+                    # For conhost: classic check
+                    if ($script:ClaudeProcess.HasExited) { Write-Host "[ClaudePlus] Terminal ferme." -ForegroundColor Yellow; break }
+                    if ($script:ClaudeCmdPid -gt 0) {
+                        $cmdProc = Get-Process -Id $script:ClaudeCmdPid -ErrorAction SilentlyContinue
+                        if (-not $cmdProc) { Write-Host "[ClaudePlus] cmd.exe termine, arret." -ForegroundColor Yellow; break }
+                    }
                 }
 
                 # --- CHECK TELEGRAM ---
@@ -1716,7 +1742,7 @@ function Invoke-ClaudePlus {
                                 if ($sessions.Count -eq 0) {
                                     $listMsg = "Aucune session active"
                                 } else {
-                                    $listMsg = "$([char]0x1F4CB) Sessions actives ($($sessions.Count)):`n"
+                                    $listMsg = "$([char]0x25A0) Sessions actives ($($sessions.Count)):`n"
                                     foreach ($s in $sessions) {
                                         $me = if ($s.Pid -eq $PID) { " $([char]0x2190) ici" } else { "" }
                                         $listMsg += "  @$($s.Name) — $(Split-Path -Leaf $s.WorkDir)$me`n"
