@@ -887,144 +887,175 @@ function Invoke-ClaudePipe {
         # Read stderr async to prevent deadlock
         $stderrTask = $proc.StandardError.ReadToEndAsync()
 
-        # State tracking for streaming
+        # State tracking
         $textBuilder = New-Object System.Text.StringBuilder
         $toolsUsed = @()
-        $currentToolName = ""
-        $currentToolInput = ""
         $lastTelegramUpdate = [DateTime]::MinValue
-        $telegramUpdateInterval = 3  # seconds between Telegram progress updates
+        $telegramUpdateInterval = 3
         $startTime = Get-Date
         $toolCount = 0
-        $hasSentProgress = $false
+        $lineCount = 0
+        $debugLogFile = "$env:TEMP\claudeplus_stream_debug.log"
+        Remove-Item $debugLogFile -ErrorAction SilentlyContinue
 
         # Emoji map for tool types
         $toolEmojis = @{
-            "Read"    = [char]0x1F4D6   # open book
-            "Write"   = [char]0x270F    # pencil
-            "Edit"    = [char]0x2702    # scissors
-            "Bash"    = [char]0x2699    # gear
-            "Grep"    = [char]0x1F50D   # magnifying glass
-            "Glob"    = [char]0x1F4C2   # open folder
-            "Search"  = [char]0x1F50E   # magnifying glass right
-            "Agent"   = [char]0x1F916   # robot
-            "Explore" = [char]0x1F9ED   # compass
+            "Read" = [char]0x1F4D6; "Write" = [char]0x270F; "Edit" = [char]0x2702
+            "Bash" = [char]0x2699; "Grep" = [char]0x1F50D; "Glob" = [char]0x1F4C2
+            "Search" = [char]0x1F50E; "Agent" = [char]0x1F916; "Explore" = [char]0x1F9ED
+            "TodoWrite" = [char]0x1F4DD; "WebSearch" = [char]0x1F310; "WebFetch" = [char]0x1F310
+        }
+
+        # Helper: recursively find tool names and text in any JSON structure
+        function Find-InJson {
+            param($obj, [string]$path = "")
+            if ($null -eq $obj) { return @() }
+            $found = @()
+
+            if ($obj -is [System.Management.Automation.PSCustomObject]) {
+                $props = $obj.PSObject.Properties
+                foreach ($p in $props) {
+                    $found += Find-InJson -obj $p.Value -path "$path.$($p.Name)"
+                }
+            }
+            elseif ($obj -is [System.Collections.IEnumerable] -and $obj -isnot [string]) {
+                $idx = 0
+                foreach ($item in $obj) {
+                    $found += Find-InJson -obj $item -path "$path[$idx]"
+                    $idx++
+                }
+            }
+            return $found
         }
 
         # Read stdout line by line (NDJSON stream)
         while (-not $proc.StandardOutput.EndOfStream) {
             $line = $proc.StandardOutput.ReadLine()
             if (-not $line -or $line.Trim().Length -eq 0) { continue }
+            $lineCount++
+
+            # Debug: log first 10 raw lines to file
+            if ($lineCount -le 10) {
+                $debugLine = "LINE $lineCount : $($line.Substring(0, [Math]::Min(500, $line.Length)))"
+                Add-Content -Path $debugLogFile -Value $debugLine -Encoding UTF8
+                Write-Host "[ClaudePlus] DEBUG L$lineCount : $($line.Substring(0, [Math]::Min(150, $line.Length)))" -ForegroundColor DarkGray
+            }
 
             try {
                 $event = $line | ConvertFrom-Json -ErrorAction Stop
             } catch {
-                # Not valid JSON, skip
+                # Not JSON — might be plain text response (fallback)
+                [void]$textBuilder.Append($line)
+                [void]$textBuilder.Append("`n")
                 continue
             }
 
-            # Handle different event structures
-            # Claude Code CLI may wrap events or send them directly
-            $eventType = $null
-            $eventData = $null
+            # ================================================================
+            # STRATEGY: Try all known Claude Code CLI stream-json formats
+            # The CLI format may differ from the raw API format
+            # ================================================================
 
-            # Try direct event format: {"type": "content_block_start", ...}
-            if ($event.type) {
-                $eventType = $event.type
-                $eventData = $event
+            $jsonStr = $line.ToLower()
+
+            # --- DETECT TOOL USE (any format) ---
+            # Look for tool_name, name with tool context, tool_use type
+            $detectedTool = $null
+
+            # Format A: API-style {"type":"content_block_start","content_block":{"type":"tool_use","name":"Read"}}
+            if ($event.content_block -and $event.content_block.type -eq "tool_use" -and $event.content_block.name) {
+                $detectedTool = $event.content_block.name
             }
-            # Try wrapped format: {"event": {"type": "content_block_start", ...}}
-            if ($event.event -and $event.event.type) {
-                $eventType = $event.event.type
-                $eventData = $event.event
+            # Format B: {"type":"tool_use","name":"Read","input":{...}}
+            if (-not $detectedTool -and $event.type -eq "tool_use" -and $event.name) {
+                $detectedTool = $event.name
             }
-            # Try subtype format: {"type": "assistant", "subtype": "...", ...}
-            if ($event.subtype) {
-                $eventType = $event.subtype
-                $eventData = $event
+            # Format C: Wrapped {"event":{"content_block":{"type":"tool_use","name":"Read"}}}
+            if (-not $detectedTool -and $event.event -and $event.event.content_block -and $event.event.content_block.name) {
+                $detectedTool = $event.event.content_block.name
+            }
+            # Format D: {"tool_name":"Read"} or {"tool":"Read"}
+            if (-not $detectedTool -and $event.tool_name) { $detectedTool = $event.tool_name }
+            if (-not $detectedTool -and $event.tool) { $detectedTool = $event.tool }
+            # Format E: {"type":"assistant","tool_use":{"name":"Read"}}
+            if (-not $detectedTool -and $event.tool_use -and $event.tool_use.name) { $detectedTool = $event.tool_use.name }
+            # Format F: Claude Code subagent {"type":"system","subtype":"tool_use",...,"tool":{"name":"Read"}}
+            if (-not $detectedTool -and $event.subtype -eq "tool_use" -and $event.tool -and $event.tool.name) { $detectedTool = $event.tool.name }
+
+            if ($detectedTool) {
+                $toolCount++
+                $emoji = $toolEmojis[$detectedTool]
+                if (-not $emoji) { $emoji = [char]0x26A1 }
+
+                # Try to get tool input preview
+                $inputPreview = ""
+                $toolInput = $null
+                if ($event.content_block -and $event.content_block.input) { $toolInput = $event.content_block.input }
+                if (-not $toolInput -and $event.input) { $toolInput = $event.input }
+                if (-not $toolInput -and $event.tool_use -and $event.tool_use.input) { $toolInput = $event.tool_use.input }
+                if (-not $toolInput -and $event.tool -and $event.tool.input) { $toolInput = $event.tool.input }
+
+                if ($toolInput) {
+                    $preview = $toolInput.pattern
+                    if (-not $preview) { $preview = $toolInput.command }
+                    if (-not $preview) { $preview = $toolInput.file_path }
+                    if (-not $preview) { $preview = $toolInput.path }
+                    if (-not $preview) { $preview = $toolInput.description }
+                    if (-not $preview) { $preview = $toolInput.query }
+                    if ($preview) {
+                        if ($preview.Length -gt 50) { $preview = $preview.Substring(0, 47) + "..." }
+                        $inputPreview = ": $preview"
+                    }
+                }
+
+                $toolDisplay = "$emoji $detectedTool$inputPreview"
+                $toolsUsed += $toolDisplay
+                Write-Host "[ClaudePlus] Stream: Tool #$toolCount -> $detectedTool$inputPreview" -ForegroundColor Magenta
+
+                # Throttled Telegram progress update
+                $now = Get-Date
+                $elapsed = [int]($now - $startTime).TotalSeconds
+                if ($TelegramToken -and $TelegramChatId) {
+                    $secsSinceUpdate = ($now - $lastTelegramUpdate).TotalSeconds
+                    if ($secsSinceUpdate -ge $telegramUpdateInterval -or $toolCount -eq 1) {
+                        $progressMsg = "$([char]0x23F3) Claude travaille... (${elapsed}s)`n"
+                        foreach ($t in $toolsUsed) { $progressMsg += "  $t`n" }
+                        Send-TelegramMessage -Message $progressMsg.TrimEnd() -Token $TelegramToken -ChatId $TelegramChatId
+                        $lastTelegramUpdate = $now
+                    }
+                }
             }
 
-            if (-not $eventType) { continue }
-
-            switch ($eventType) {
-                "content_block_start" {
-                    $block = $eventData.content_block
-                    if (-not $block) { $block = $eventData }
-                    if ($block.type -eq "tool_use" -and $block.name) {
-                        $currentToolName = $block.name
-                        $currentToolInput = ""
-                        $toolCount++
-
-                        # Get emoji for this tool
-                        $emoji = $toolEmojis[$currentToolName]
-                        if (-not $emoji) { $emoji = [char]0x26A1 }  # lightning bolt default
-
-                        $toolDisplay = "$emoji $currentToolName"
-                        $toolsUsed += $toolDisplay
-                        Write-Host "[ClaudePlus] Stream: Tool #$toolCount -> $currentToolName" -ForegroundColor Magenta
-
-                        # Send Telegram progress update (throttled)
-                        $now = Get-Date
-                        $elapsed = [int]($now - $startTime).TotalSeconds
-                        if ($TelegramToken -and $TelegramChatId) {
-                            $secsSinceUpdate = ($now - $lastTelegramUpdate).TotalSeconds
-                            if ($secsSinceUpdate -ge $telegramUpdateInterval -or $toolCount -eq 1) {
-                                $progressMsg = "$([char]0x23F3) Claude travaille... (${elapsed}s)`n"
-                                foreach ($t in $toolsUsed) {
-                                    $progressMsg += "  $t`n"
-                                }
-                                Send-TelegramMessage -Message $progressMsg.TrimEnd() -Token $TelegramToken -ChatId $TelegramChatId
-                                $lastTelegramUpdate = $now
-                                $hasSentProgress = $true
-                            }
-                        }
+            # --- DETECT TEXT CONTENT (any format) ---
+            # Format A: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}
+            if ($event.delta -and $event.delta.type -eq "text_delta" -and $event.delta.text) {
+                [void]$textBuilder.Append($event.delta.text)
+            }
+            # Format B: {"type":"text","text":"Hello"}
+            elseif ($event.type -eq "text" -and $event.text) {
+                [void]$textBuilder.Append($event.text)
+            }
+            # Format C: Wrapped {"event":{"delta":{"type":"text_delta","text":"Hello"}}}
+            elseif ($event.event -and $event.event.delta -and $event.event.delta.text) {
+                [void]$textBuilder.Append($event.event.delta.text)
+            }
+            # Format D: {"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}
+            elseif ($event.message -and $event.message.content) {
+                foreach ($block in $event.message.content) {
+                    if ($block.type -eq "text" -and $block.text) {
+                        [void]$textBuilder.Append($block.text)
                     }
                 }
-                "content_block_delta" {
-                    $delta = $eventData.delta
-                    if (-not $delta) { $delta = $eventData }
-                    if ($delta.type -eq "text_delta" -and $delta.text) {
-                        [void]$textBuilder.Append($delta.text)
-                    }
-                    if ($delta.type -eq "input_json_delta" -and $delta.partial_json) {
-                        $currentToolInput += $delta.partial_json
-                    }
-                }
-                "content_block_stop" {
-                    if ($currentToolName) {
-                        # Try to extract a short description from tool input
-                        $inputPreview = ""
-                        if ($currentToolInput.Length -gt 0) {
-                            try {
-                                $inputObj = $currentToolInput | ConvertFrom-Json -ErrorAction Stop
-                                # Extract meaningful field (pattern, command, file_path, etc.)
-                                $preview = $inputObj.pattern
-                                if (-not $preview) { $preview = $inputObj.command }
-                                if (-not $preview) { $preview = $inputObj.file_path }
-                                if (-not $preview) { $preview = $inputObj.path }
-                                if (-not $preview) { $preview = $inputObj.description }
-                                if ($preview) {
-                                    if ($preview.Length -gt 60) { $preview = $preview.Substring(0, 57) + "..." }
-                                    $inputPreview = ": $preview"
-                                }
-                            } catch { }
-                        }
-                        if ($inputPreview) {
-                            Write-Host "[ClaudePlus] Stream:   -> $currentToolName$inputPreview" -ForegroundColor DarkMagenta
-                            # Update the last tool entry with detail
-                            if ($toolsUsed.Count -gt 0) {
-                                $emoji = $toolEmojis[$currentToolName]
-                                if (-not $emoji) { $emoji = [char]0x26A1 }
-                                $toolsUsed[$toolsUsed.Count - 1] = "$emoji $currentToolName$inputPreview"
-                            }
-                        }
-                        $currentToolName = ""
-                        $currentToolInput = ""
-                    }
-                }
-                "message_stop" {
-                    Write-Host "[ClaudePlus] Stream: message_stop" -ForegroundColor DarkGray
-                }
+            }
+            # Format E: {"type":"result","result":"Hello full response"}
+            elseif ($event.type -eq "result" -and $event.result) {
+                [void]$textBuilder.Append($event.result)
+            }
+            # Format F: {"content":"Hello"} or {"response":"Hello"}
+            elseif ($event.content -and $event.content -is [string] -and $event.content.Length -gt 2) {
+                [void]$textBuilder.Append($event.content)
+            }
+            elseif ($event.response -and $event.response -is [string]) {
+                [void]$textBuilder.Append($event.response)
             }
         }
 
@@ -1036,7 +1067,7 @@ function Invoke-ClaudePipe {
         $exitCode = if ($proc.HasExited) { $proc.ExitCode } else { -1 }
         $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
 
-        Write-Host "[ClaudePlus] Stream: exit=$exitCode, ${elapsed}s, $toolCount tools, $($textBuilder.Length) chars" -ForegroundColor DarkGray
+        Write-Host "[ClaudePlus] Stream: exit=$exitCode, ${elapsed}s, $lineCount lines, $toolCount tools, $($textBuilder.Length) chars text" -ForegroundColor DarkGray
 
         if ($stderr -and $stderr.Trim().Length -gt 0) {
             $stderrPreview = $stderr.Substring(0, [Math]::Min(300, $stderr.Length))
@@ -1046,9 +1077,7 @@ function Invoke-ClaudePipe {
         # Send final progress summary if tools were used
         if ($TelegramToken -and $TelegramChatId -and $toolCount -gt 0) {
             $summaryMsg = "$([char]0x2705) Termine (${elapsed}s, $toolCount outils)`n"
-            foreach ($t in $toolsUsed) {
-                $summaryMsg += "  $t`n"
-            }
+            foreach ($t in $toolsUsed) { $summaryMsg += "  $t`n" }
             Send-TelegramMessage -Message $summaryMsg.TrimEnd() -Token $TelegramToken -ChatId $TelegramChatId
         }
 
@@ -1057,14 +1086,12 @@ function Invoke-ClaudePipe {
             Write-Host "[ClaudePlus] Stream: reponse OK ($($result.Length) chars)" -ForegroundColor Green
             return $result
         } else {
-            Write-Host "[ClaudePlus] Stream: reponse vide (exit=$exitCode)" -ForegroundColor Yellow
-            # Fallback: if stream-json produced no text, try plain pipe mode
+            Write-Host "[ClaudePlus] Stream: reponse vide, $lineCount lignes lues. Voir debug: $debugLogFile" -ForegroundColor Yellow
             Write-Host "[ClaudePlus] Stream: fallback vers pipe mode classique..." -ForegroundColor Yellow
             return Invoke-ClaudePipePlain -Message $Message -ClaudePath $ClaudePath -WorkDir $WorkDir -Continue:$Continue -DangerouslySkipPermissions:$DangerouslySkipPermissions
         }
     } catch {
-        Write-Host "[ClaudePlus] Stream erreur: $_" -ForegroundColor Red
-        # Fallback to plain pipe
+        Write-Host "[ClaudePlus] Stream erreur: $_ — fallback pipe plain" -ForegroundColor Red
         return Invoke-ClaudePipePlain -Message $Message -ClaudePath $ClaudePath -WorkDir $WorkDir -Continue:$Continue -DangerouslySkipPermissions:$DangerouslySkipPermissions
     }
 }
