@@ -1454,45 +1454,97 @@ function Invoke-ClaudePlus {
         )
         $batLines -join "`r`n" | Set-Content $batPath -Encoding ASCII
 
-        # Launch via conhost.exe
-        $conhost = "$env:SystemRoot\System32\conhost.exe"
-        if (Test-Path $conhost) {
-            Write-Host "[ClaudePlus] Lancement via conhost.exe..." -ForegroundColor Cyan
-            $script:ClaudeProcess = Start-Process -FilePath $conhost -ArgumentList "cmd.exe /c `"$batPath`"" -PassThru
+        # Launch via Windows Terminal (wt.exe) if available, fallback to conhost.exe
+        $wtPath = (Get-Command wt.exe -ErrorAction SilentlyContinue).Source
+        if ($wtPath) {
+            Write-Host "[ClaudePlus] Lancement via Windows Terminal (wt.exe)..." -ForegroundColor Cyan
+            $script:ClaudeProcess = Start-Process -FilePath $wtPath -ArgumentList "--title `"ClaudePlus @$Name`" cmd.exe /c `"$batPath`"" -PassThru
+            $script:UsesWindowsTerminal = $true
         } else {
-            $script:ClaudeProcess = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$batPath`"" -PassThru
+            $conhost = "$env:SystemRoot\System32\conhost.exe"
+            if (Test-Path $conhost) {
+                Write-Host "[ClaudePlus] Lancement via conhost.exe..." -ForegroundColor Cyan
+                $script:ClaudeProcess = Start-Process -FilePath $conhost -ArgumentList "cmd.exe /c `"$batPath`"" -PassThru
+            } else {
+                $script:ClaudeProcess = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$batPath`"" -PassThru
+            }
+            $script:UsesWindowsTerminal = $false
         }
 
-        Write-Host "[ClaudePlus] Conhost PID: $($script:ClaudeProcess.Id)" -ForegroundColor DarkGray
+        Write-Host "[ClaudePlus] PID: $($script:ClaudeProcess.Id) ($(if($script:UsesWindowsTerminal){'Windows Terminal'}else{'conhost'}))" -ForegroundColor DarkGray
 
-        # Wait and find child cmd.exe + its window handle
+        # Wait and find the terminal window handle
         Write-Host "[ClaudePlus] Recherche de la fenetre Claude..." -ForegroundColor DarkGray
         $found = $false
-        for ($i = 0; $i -lt 20; $i++) {
-            Start-Sleep -Milliseconds 500
 
-            # Find child cmd PID
-            if ($script:ClaudeCmdPid -eq 0) {
-                $script:ClaudeCmdPid = Find-ChildCmdPid -ParentPid $script:ClaudeProcess.Id
+        if ($script:UsesWindowsTerminal) {
+            # Windows Terminal: wt.exe spawns WindowsTerminal.exe which owns the window
+            # The window title contains our custom title "ClaudePlus @name"
+            for ($i = 0; $i -lt 30; $i++) {
+                Start-Sleep -Milliseconds 500
+                # Find WindowsTerminal process with our title
+                Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue | ForEach-Object {
+                    if ($_.MainWindowHandle -ne [IntPtr]::Zero -and -not $found) {
+                        if ($_.MainWindowTitle -match "ClaudePlus" -or $_.MainWindowTitle -match $Name) {
+                            $script:ClaudeWindowHandle = $_.MainWindowHandle
+                            $found = $true
+                            Write-Host "[ClaudePlus] FENETRE Windows Terminal TROUVEE! Handle=$($_.MainWindowHandle) Title='$($_.MainWindowTitle)'" -ForegroundColor Green
+                        }
+                    }
+                }
+                if ($found) { break }
+
+                # Also try: WT may reuse existing window, find cmd.exe child
+                if ($script:ClaudeCmdPid -eq 0) {
+                    # WT process tree: wt.exe -> OpenConsole.exe -> cmd.exe -> claude
+                    try {
+                        $wtChildren = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($script:ClaudeProcess.Id)" -ErrorAction SilentlyContinue
+                        foreach ($wc in $wtChildren) {
+                            $wcChildren = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($wc.ProcessId)" -ErrorAction SilentlyContinue
+                            foreach ($wcc in $wcChildren) {
+                                if ($wcc.Name -eq "cmd.exe") { $script:ClaudeCmdPid = [int]$wcc.ProcessId }
+                            }
+                            if ($wc.Name -eq "cmd.exe") { $script:ClaudeCmdPid = [int]$wc.ProcessId }
+                        }
+                    } catch { }
+                }
             }
 
-            # Try to get window handle
-            if ($script:ClaudeCmdPid -gt 0) {
-                $hwnd = Get-WindowHandleForPid -Pid1 $script:ClaudeCmdPid
-                if ($hwnd -ne [IntPtr]::Zero) {
-                    $found = $true
-                    $script:ClaudeWindowHandle = $hwnd
-                    Write-Host "[ClaudePlus] FENETRE TROUVEE! cmd PID=$($script:ClaudeCmdPid), Handle=$hwnd" -ForegroundColor Green
-                    break
+            # If we didn't find by title, try any WT window that appeared after our launch
+            if (-not $found) {
+                Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue | ForEach-Object {
+                    if ($_.MainWindowHandle -ne [IntPtr]::Zero -and -not $found) {
+                        $script:ClaudeWindowHandle = $_.MainWindowHandle
+                        $found = $true
+                        Write-Host "[ClaudePlus] FENETRE WT trouvee (fallback)! Handle=$($_.MainWindowHandle)" -ForegroundColor Yellow
+                    }
+                }
+            }
+        } else {
+            # conhost.exe: classic approach
+            for ($i = 0; $i -lt 20; $i++) {
+                Start-Sleep -Milliseconds 500
+
+                if ($script:ClaudeCmdPid -eq 0) {
+                    $script:ClaudeCmdPid = Find-ChildCmdPid -ParentPid $script:ClaudeProcess.Id
+                }
+
+                if ($script:ClaudeCmdPid -gt 0) {
+                    $hwnd = Get-WindowHandleForPid -Pid1 $script:ClaudeCmdPid
+                    if ($hwnd -ne [IntPtr]::Zero) {
+                        $found = $true
+                        $script:ClaudeWindowHandle = $hwnd
+                        Write-Host "[ClaudePlus] FENETRE conhost TROUVEE! cmd PID=$($script:ClaudeCmdPid), Handle=$hwnd" -ForegroundColor Green
+                        break
+                    }
                 }
             }
         }
 
+        # Fallback scan for both modes
         if (-not $found) {
-            Write-Host "[ClaudePlus] Fenetre non trouvee apres 10s, tentative scan..." -ForegroundColor Yellow
-            # Scan all cmd.exe for our child
+            Write-Host "[ClaudePlus] Fenetre non trouvee, tentative scan..." -ForegroundColor Yellow
             Get-Process -Name "cmd" -ErrorAction SilentlyContinue | ForEach-Object {
-                Write-Host "  cmd PID=$($_.Id) Handle=$($_.MainWindowHandle) Title='$($_.MainWindowTitle)'" -ForegroundColor DarkGray
                 if ($_.MainWindowHandle -ne [IntPtr]::Zero -and -not $found) {
                     try {
                         $wmi = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue
@@ -1508,7 +1560,7 @@ function Invoke-ClaudePlus {
         }
 
         if (-not $found) {
-            Write-Host "[ClaudePlus] ATTENTION: Pas de handle fenetre. Le mirror peut echouer." -ForegroundColor Red
+            Write-Host "[ClaudePlus] ATTENTION: Pas de handle fenetre. Le mirror TUI peut echouer (pipe mode OK)." -ForegroundColor Red
         }
 
         # Initialize voice transcription (Python + faster-whisper + ffmpeg)
