@@ -864,12 +864,12 @@ function Invoke-ClaudePipe {
     )
 
     $escapedMsg = $Message -replace '"', '\"'
-    $argList = @("-p", "`"$escapedMsg`"", "--output-format", "stream-json")
+    $argList = @("-p", "`"$escapedMsg`"", "--output-format", "stream-json", "--verbose")
     if ($Continue) { $argList += "--continue" }
     if ($DangerouslySkipPermissions) { $argList += "--dangerously-skip-permissions" }
     $argStr = $argList -join " "
 
-    Write-Host "[ClaudePlus] Stream: claude -p --output-format stream-json $(if($Continue){'--continue '})" -ForegroundColor DarkCyan
+    Write-Host "[ClaudePlus] Stream: claude -p --output-format stream-json --verbose $(if($Continue){'--continue '})" -ForegroundColor DarkCyan
 
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -1178,8 +1178,9 @@ function Invoke-ClaudePipePlain {
 }
 
 # ============================================================================
-# SEND TEXT TO CLAUDE WINDOW (legacy - used for TUI terminal mode)
-# Uses: MainWindowHandle + SetForegroundWindow + WshShell.SendKeys
+# SEND TEXT TO CLAUDE WINDOW
+# Windows Terminal: uses SendInput (simulated keyboard, works with GPU renderer)
+# conhost.exe: uses PostMessage WM_CHAR (direct buffer write, no focus needed)
 # ============================================================================
 
 function Send-TextToClaude {
@@ -1198,13 +1199,89 @@ function Send-TextToClaude {
         return $false
     }
 
-    Write-Host "[ClaudePlus] Envoi via PostMessage WM_CHAR vers hwnd=$hwnd..." -ForegroundColor DarkGray
+    $mode = if ($script:UsesWindowsTerminal) { "SendInput" } else { "PostMessage" }
+    Write-Host "[ClaudePlus] Envoi via $mode vers hwnd=$hwnd..." -ForegroundColor DarkGray
 
     try {
-        # PostMessage WM_CHAR approach -- no AttachConsole needed, works with conhost.exe windows
-        # Builds a C# helper that posts chars directly to the window message queue
         $csFile = "$env:TEMP\claudeplus_poster.cs"
-        $csCode = @"
+
+        if ($script:UsesWindowsTerminal) {
+            # SendInput approach — simulates real keyboard input
+            # Required for Windows Terminal (GPU-rendered, ignores PostMessage)
+            $csCode = @"
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+public class ConPoster {
+    [StructLayout(LayoutKind.Sequential)] public struct INPUT {
+        public uint type;
+        public INPUTUNION data;
+    }
+    [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION {
+        [FieldOffset(0)] public KEYBDINPUT ki;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+    const uint INPUT_KEYBOARD = 1;
+    const uint KEYEVENTF_UNICODE = 0x0004;
+    const uint KEYEVENTF_KEYUP = 0x0002;
+    const int VK_RETURN = 0x0D;
+    [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int cmd);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr pid);
+    [DllImport("user32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    static void SendChar(char c) {
+        var down = new INPUT { type = INPUT_KEYBOARD };
+        down.data.ki.wScan = (ushort)c;
+        down.data.ki.dwFlags = KEYEVENTF_UNICODE;
+        var up = new INPUT { type = INPUT_KEYBOARD };
+        up.data.ki.wScan = (ushort)c;
+        up.data.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        SendInput(2, new INPUT[] { down, up }, Marshal.SizeOf(typeof(INPUT)));
+    }
+    static void SendVK(ushort vk) {
+        var down = new INPUT { type = INPUT_KEYBOARD };
+        down.data.ki.wVk = vk;
+        var up = new INPUT { type = INPUT_KEYBOARD };
+        up.data.ki.wVk = vk;
+        up.data.ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, new INPUT[] { down, up }, Marshal.SizeOf(typeof(INPUT)));
+    }
+    public static string Send(long hwnd, string text) {
+        var h = new IntPtr(hwnd);
+        try {
+            ShowWindow(h, 9);
+            BringWindowToTop(h);
+            uint wndThread = GetWindowThreadProcessId(h, IntPtr.Zero);
+            uint curThread = GetCurrentThreadId();
+            AttachThreadInput(curThread, wndThread, true);
+            SetForegroundWindow(h);
+            AttachThreadInput(curThread, wndThread, false);
+        } catch {}
+        Thread.Sleep(500);
+        int n = 0;
+        foreach (char c in text) {
+            SendChar(c);
+            Thread.Sleep(20);
+            n++;
+        }
+        Thread.Sleep(150);
+        SendVK((ushort)VK_RETURN);
+        return "OK:sent=" + n;
+    }
+}
+"@
+        } else {
+            # PostMessage approach — works with conhost.exe (no focus stealing)
+            $csCode = @"
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -1222,9 +1299,8 @@ public class ConPoster {
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
     public static string Send(long hwnd, string text) {
         var h = new IntPtr(hwnd);
-        // Bring window to foreground using AttachThreadInput trick
         try {
-            ShowWindow(h, 9); // SW_RESTORE
+            ShowWindow(h, 9);
             BringWindowToTop(h);
             uint wndThread = GetWindowThreadProcessId(h, IntPtr.Zero);
             uint curThread = GetCurrentThreadId();
@@ -1233,7 +1309,6 @@ public class ConPoster {
             AttachThreadInput(curThread, wndThread, false);
         } catch {}
         Thread.Sleep(400);
-        // Send each character via WM_CHAR
         int n = 0;
         foreach (char c in text) {
             PostMessage(h, WM_CHAR, (IntPtr)c, (IntPtr)1);
@@ -1241,7 +1316,6 @@ public class ConPoster {
             n++;
         }
         Thread.Sleep(150);
-        // Send Enter
         PostMessage(h, WM_KEYDOWN, (IntPtr)VK_RETURN, (IntPtr)1);
         Thread.Sleep(30);
         PostMessage(h, WM_KEYUP,   (IntPtr)VK_RETURN, (IntPtr)1);
@@ -1249,6 +1323,7 @@ public class ConPoster {
     }
 }
 "@
+        }
         $textFile = "$env:TEMP\claudeplus_sendtext.txt"
         $logFile  = "$textFile.log"
         [System.IO.File]::WriteAllText($csFile, $csCode, [System.Text.Encoding]::UTF8)
