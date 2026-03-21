@@ -9,9 +9,11 @@ Add-Type -AssemblyName System.Windows.Forms
 $script:ConfigPath = "$env:LOCALAPPDATA\ClaudePlus\config.json"
 $script:ProjectTelegramConfig = "$([Environment]::GetFolderPath('MyDocuments'))\Visual Studio 2026\FiscalIQ\Claude Code Extension\telegram-config.json"
 $script:VsExtensionConfig = "$env:LOCALAPPDATA\ClaudeCodeExtension\claudecode-settings.json"
+$script:SessionRegistryDir = "$env:LOCALAPPDATA\ClaudePlus\sessions"
 $script:ClaudeProcess = $null
 $script:ClaudeCmdPid = 0
 $script:WshShell = New-Object -ComObject WScript.Shell
+$script:SessionName = $null  # Set via -Name parameter, used for @prefix routing
 
 # No direct P/Invoke for console write - PowerShell shares its own console
 # All WriteConsoleInput calls go through a helper process (see Send-TextToClaude)
@@ -1255,12 +1257,125 @@ public class ConPoster {
 }
 
 # ============================================================================
+# MULTI-SESSION MANAGEMENT (@prefix routing)
+# Each terminal registers itself with a name. Telegram messages prefixed
+# with @name are routed to the matching terminal. No prefix = default session.
+# Session registry: %LOCALAPPDATA%\ClaudePlus\sessions\<name>.json
+# ============================================================================
+
+function Register-Session {
+    param([string]$Name)
+    if (-not $Name) { return }
+    if (-not (Test-Path $script:SessionRegistryDir)) {
+        New-Item -ItemType Directory -Path $script:SessionRegistryDir -Force | Out-Null
+    }
+    $sessionFile = Join-Path $script:SessionRegistryDir "$Name.json"
+    $sessionData = @{
+        Name = $Name
+        Pid = $PID
+        StartTime = (Get-Date).ToString("o")
+        WorkDir = (Get-Location).Path
+    } | ConvertTo-Json
+    [System.IO.File]::WriteAllText($sessionFile, $sessionData, [System.Text.Encoding]::UTF8)
+    $script:SessionName = $Name
+    Write-Host "[ClaudePlus] Session '$Name' enregistree (PID=$PID)" -ForegroundColor Green
+}
+
+function Unregister-Session {
+    param([string]$Name)
+    if (-not $Name) { return }
+    $sessionFile = Join-Path $script:SessionRegistryDir "$Name.json"
+    if (Test-Path $sessionFile) {
+        Remove-Item $sessionFile -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-ActiveSessions {
+    if (-not (Test-Path $script:SessionRegistryDir)) { return @() }
+    $sessions = @()
+    Get-ChildItem -Path $script:SessionRegistryDir -Filter "*.json" -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            $data = Get-Content $_.FullName -Raw | ConvertFrom-Json
+            # Check if process is still alive
+            $proc = Get-Process -Id $data.Pid -ErrorAction SilentlyContinue
+            if ($proc) {
+                $sessions += $data
+            } else {
+                # Dead session, clean up
+                Remove-Item $_.FullName -ErrorAction SilentlyContinue
+            }
+        } catch {
+            Remove-Item $_.FullName -ErrorAction SilentlyContinue
+        }
+    }
+    return $sessions
+}
+
+# Parse @prefix from message. Returns @{Target="name"; Text="actual message"} or @{Target=$null; Text="original"}
+function Parse-MessageTarget {
+    param([string]$Message)
+    if ($Message -match '^@(\S+)\s+(.+)$') {
+        return @{ Target = $Matches[1].ToLower(); Text = $Matches[2] }
+    }
+    if ($Message -match '^@(\S+)$') {
+        # Just "@name" with no message — ignore
+        return @{ Target = $Matches[1].ToLower(); Text = "" }
+    }
+    return @{ Target = $null; Text = $Message }
+}
+
+# Check if this session should handle the message
+function Test-MessageForMe {
+    param([string]$RawText)
+
+    $parsed = Parse-MessageTarget -Message $RawText
+
+    # Commands like /stop, /list are always handled by everyone
+    if ($parsed.Text -match '^/(stop|list|sessions|help)') {
+        return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $true }
+    }
+
+    # If message has @prefix
+    if ($parsed.Target) {
+        $myName = $script:SessionName
+        if (-not $myName) { return @{ ShouldHandle = $false; Text = ""; IsCommand = $false } }
+
+        # Check if target matches my name (case-insensitive)
+        if ($parsed.Target -eq $myName.ToLower()) {
+            return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $false }
+        }
+        # Partial match (e.g., @fis matches "fiscal")
+        if ($myName.ToLower().StartsWith($parsed.Target)) {
+            return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $false }
+        }
+        return @{ ShouldHandle = $false; Text = ""; IsCommand = $false }
+    }
+
+    # No @prefix: only handle if I'm the only session, or if I'm the default (first registered)
+    $activeSessions = Get-ActiveSessions
+    if ($activeSessions.Count -le 1) {
+        # I'm the only one — handle it
+        return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $false }
+    }
+
+    # Multiple sessions active: only the "default" (lowest PID = oldest) handles unprefixed messages
+    $minPid = ($activeSessions | Sort-Object { [int]$_.Pid } | Select-Object -First 1).Pid
+    if ([int]$minPid -eq $PID) {
+        return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $false }
+    }
+
+    # Not for me
+    return @{ ShouldHandle = $false; Text = ""; IsCommand = $false }
+}
+
+# ============================================================================
 # MAIN COMMAND: claudeplus
 # ============================================================================
 
 function Invoke-ClaudePlus {
     [CmdletBinding()]
     param(
+        [string]$Name,
         [switch]$NoTelegram,
         [switch]$NoDangerouslySkipPermissions,
         [Parameter(ValueFromRemainingArguments=$true)]
@@ -1284,17 +1399,38 @@ function Invoke-ClaudePlus {
     }
     if ($ClaudeArgs) { $claudeArgsList += $ClaudeArgs }
 
+    # Auto-generate session name from current folder if not provided
+    if (-not $Name) {
+        $Name = (Split-Path -Leaf (Get-Location).Path).ToLower() -replace '[^a-z0-9]', ''
+        if (-not $Name -or $Name.Length -lt 2) { $Name = "claude" }
+    }
+    $Name = $Name.ToLower()
+
     Write-Host ""
     Write-Host "  +============================================+" -ForegroundColor DarkCyan
     Write-Host "  |         ClaudePlus - FiscalIQ               |" -ForegroundColor DarkCyan
     Write-Host "  |   Claude Code + Telegram Mirror             |" -ForegroundColor DarkCyan
+    Write-Host "  |   Session: @$Name                           " -ForegroundColor DarkCyan
     Write-Host "  +============================================+" -ForegroundColor DarkCyan
     Write-Host ""
 
     $useTelegram = (-not $NoTelegram -and $config.AutoTelegram -and $config.TelegramBotToken -and $config.TelegramChatId)
 
     if ($useTelegram) {
-        Write-Host "[ClaudePlus] Mode Mirror Telegram actif." -ForegroundColor Green
+        # Register this session
+        Register-Session -Name $Name
+        $activeSessions = Get-ActiveSessions
+        $sessionCount = $activeSessions.Count
+
+        Write-Host "[ClaudePlus] Mode Mirror Telegram actif. Session '@$Name' ($sessionCount active(s))" -ForegroundColor Green
+        if ($sessionCount -gt 1) {
+            Write-Host "[ClaudePlus] Sessions actives:" -ForegroundColor Cyan
+            foreach ($s in $activeSessions) {
+                $marker = if ($s.Pid -eq $PID) { " (moi)" } else { "" }
+                Write-Host "  @$($s.Name)$marker — $($s.WorkDir)" -ForegroundColor White
+            }
+            Write-Host "[ClaudePlus] Utilisez @$Name <message> pour cibler cette session" -ForegroundColor Yellow
+        }
 
         # RESET all state from previous session
         $script:ClaudeProcess = $null
@@ -1377,11 +1513,24 @@ function Invoke-ClaudePlus {
 
         # Initialize voice transcription (Python + faster-whisper + ffmpeg)
         $voiceOk = Initialize-Transcription
-        if ($voiceOk) {
-            Send-TelegramMessage -Message "ClaudePlus demarre! Envoyez vos messages (texte ou vocal).`n/stop pour arreter." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
-        } else {
-            Send-TelegramMessage -Message "ClaudePlus demarre! Envoyez vos messages texte.`n(Vocal desactive - Python/faster-whisper manquant)`n/stop pour arreter." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+
+        # Build startup message with session info
+        $startupLines = @()
+        $startupLines += "$([char]0x1F680) @$Name demarre!"
+        $startupLines += "Dossier: $(Split-Path -Leaf $workDir)"
+        if ($sessionCount -gt 1) {
+            $otherNames = ($activeSessions | Where-Object { $_.Pid -ne $PID } | ForEach-Object { "@$($_.Name)" }) -join ", "
+            $startupLines += "Autres sessions: $otherNames"
+            $startupLines += ""
+            $startupLines += "Prefixez avec @$Name pour cibler cette session"
         }
+        if ($voiceOk) {
+            $startupLines += "Texte et vocal OK"
+        } else {
+            $startupLines += "Texte OK (vocal desactive)"
+        }
+        $startupLines += "/stop pour arreter | /list pour voir les sessions"
+        Send-TelegramMessage -Message ($startupLines -join "`n") -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
 
         # Wait for Claude TUI to start in the visible terminal
         Write-Host "[ClaudePlus] Attente demarrage Claude TUI (3s)..." -ForegroundColor DarkGray
@@ -1472,21 +1621,50 @@ function Invoke-ClaudePlus {
 
                             if (-not $text -or $text.Length -eq 0) { continue }
 
-                            if ($text -match "^/stop") {
-                                Send-TelegramMessage -Message "Mirror arrete." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                            # --- MULTI-SESSION ROUTING ---
+                            $routing = Test-MessageForMe -RawText $text
+
+                            # Handle /list command (show active sessions)
+                            if ($routing.IsCommand -and $routing.Text -match '^/list|^/sessions') {
+                                $sessions = Get-ActiveSessions
+                                if ($sessions.Count -eq 0) {
+                                    $listMsg = "Aucune session active"
+                                } else {
+                                    $listMsg = "$([char]0x1F4CB) Sessions actives ($($sessions.Count)):`n"
+                                    foreach ($s in $sessions) {
+                                        $me = if ($s.Pid -eq $PID) { " $([char]0x2190) ici" } else { "" }
+                                        $listMsg += "  @$($s.Name) — $(Split-Path -Leaf $s.WorkDir)$me`n"
+                                    }
+                                    $listMsg += "`nPrefixez: @nom message"
+                                }
+                                Send-TelegramMessage -Message $listMsg.TrimEnd() -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                continue
+                            }
+
+                            if ($routing.IsCommand -and $routing.Text -match '^/stop') {
+                                Send-TelegramMessage -Message "@$Name arrete." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                                 $stopRequested = $true
                                 break
                             }
 
+                            if (-not $routing.ShouldHandle) {
+                                # Message is for another session, skip silently
+                                continue
+                            }
+
+                            # Use the cleaned text (without @prefix)
+                            $text = $routing.Text
+                            if (-not $text -or $text.Length -eq 0) { continue }
+
                             # Skip if already waiting for a response
                             if ($waitingForResponse) {
-                                Send-TelegramMessage -Message "[ATTENTE] Claude est en train de repondre, patientez..." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                Send-TelegramMessage -Message "[@$Name] ATTENTE — Claude est en train de repondre, patientez..." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                                 continue
                             }
 
                             if (-not $isVoice) {
                                 Write-Host ""
-                                Write-Host "  >> $text" -ForegroundColor Cyan
+                                Write-Host "  >> [$Name] $text" -ForegroundColor Cyan
                             }
 
                             $waitingForResponse = $true
@@ -1518,13 +1696,13 @@ function Invoke-ClaudePlus {
                                 if ($responseText.Length -gt 3900) {
                                     $responseText = $responseText.Substring(0, 3900) + "`n[... tronque]"
                                 }
-                                # Send final response with separator
-                                $finalMsg = "$([char]0x2500)$([char]0x2500)$([char]0x2500) Reponse $([char]0x2500)$([char]0x2500)$([char]0x2500)`n$responseText"
+                                # Send final response with separator and session tag
+                                $finalMsg = "$([char]0x2500)$([char]0x2500) @$Name $([char]0x2500)$([char]0x2500)`n$responseText"
                                 Send-TelegramMessage -Message $finalMsg -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                             } else {
                                 Write-Host "  << [pas de reponse]" -ForegroundColor Yellow
                                 Write-Host ""
-                                Send-TelegramMessage -Message "[Pas de reponse - verifiez le terminal]" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                Send-TelegramMessage -Message "[@$Name] Pas de reponse - verifiez le terminal" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                             }
                         }
                     }
@@ -1535,11 +1713,11 @@ function Invoke-ClaudePlus {
             }
         }
         finally {
-            Send-TelegramMessage -Message "ClaudePlus terminee." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+            Unregister-Session -Name $Name
+            Send-TelegramMessage -Message "@$Name terminee." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
             if (Test-Path $batPath) { Remove-Item $batPath -ErrorAction SilentlyContinue }
-            # ConsoleReaderScript no longer used (switched to WM_SYSCOMMAND approach)
             Write-Host ""
-            Write-Host "[ClaudePlus] Session terminee." -ForegroundColor DarkCyan
+            Write-Host "[ClaudePlus] Session '@$Name' terminee." -ForegroundColor DarkCyan
         }
     }
     else {
