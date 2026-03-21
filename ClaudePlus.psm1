@@ -14,12 +14,21 @@ $script:ClaudeProcess = $null
 $script:ClaudeCmdPid = 0
 $script:WshShell = New-Object -ComObject WScript.Shell
 $script:SessionName = $null  # Set via -Name parameter, used for @prefix routing
+$script:PendingMessage = $null  # Stores message awaiting session choice: @{Text; Type; ImagePaths; FilePaths; Timestamp}
+$script:WaitingForSessionChoice = $false  # True when waiting for user to pick session number
+$script:SessionChoiceMap = @{}  # Maps number -> session name for current choice
 
 # No direct P/Invoke for console write - PowerShell shares its own console
 # All WriteConsoleInput calls go through a helper process (see Send-TextToClaude)
 
 $script:LastConsoleText = ""
 $script:ReaderExe = $null
+$script:PendingImagePaths = @()
+$script:PendingFilePaths = @()
+$script:LastPipeTools = @()
+$script:LastPipeToolCount = 0
+$script:LastPipeElapsed = 0
+$script:TelegramVerbose = $true  # true = outils+progression+resultat, false = resultat seulement
 
 # ============================================================================
 # READ CLAUDE CONSOLE OUTPUT
@@ -579,12 +588,20 @@ function Save-ClaudePlusConfig($config) {
 
 function Send-TelegramMessage {
     param([string]$Message, [string]$Token, [string]$ChatId)
-    if ([string]::IsNullOrEmpty($Message) -or [string]::IsNullOrEmpty($Token) -or [string]::IsNullOrEmpty($ChatId)) { return }
+    if ([string]::IsNullOrEmpty($Message) -or [string]::IsNullOrEmpty($Token) -or [string]::IsNullOrEmpty($ChatId)) {
+        Write-Host "[ClaudePlus] TG SKIP: msg=$([string]::IsNullOrEmpty($Message)) tok=$([string]::IsNullOrEmpty($Token)) chat=$([string]::IsNullOrEmpty($ChatId))" -ForegroundColor Red
+        return
+    }
     if ($Message.Length -gt 4000) { $Message = $Message.Substring(0, 4000) + "`n[...]" }
     try {
         $body = @{ chat_id = $ChatId; text = $Message; disable_web_page_preview = "true" }
-        Invoke-RestMethod -Uri "https://api.telegram.org/bot$Token/sendMessage" -Method Post -Body $body -TimeoutSec 10 -ErrorAction SilentlyContinue | Out-Null
-    } catch { }
+        $result = Invoke-RestMethod -Uri "https://api.telegram.org/bot$Token/sendMessage" -Method Post -Body $body -TimeoutSec 10 -ErrorAction Stop
+        if (-not $result.ok) {
+            Write-Host "[ClaudePlus] TG ERREUR: $($result | ConvertTo-Json -Compress)" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "[ClaudePlus] TG EXCEPTION: $_" -ForegroundColor Red
+    }
 }
 
 function Delete-TelegramWebhook {
@@ -607,7 +624,6 @@ function Initialize-Transcription {
     }
     if (-not $py) {
         Write-Host "[ClaudePlus] ERREUR: Python 3.x requis pour la transcription vocale." -ForegroundColor Red
-        Write-Host "[ClaudePlus] Installez Python: https://www.python.org/downloads/" -ForegroundColor Yellow
         return $false
     }
     Write-Host "[ClaudePlus] Python OK: $py" -ForegroundColor DarkGray
@@ -618,99 +634,217 @@ function Initialize-Transcription {
     Write-Host "[ClaudePlus] Import check faster-whisper: '$checkWhisper'" -ForegroundColor DarkGray
     if ($checkWhisper -ne "ok") {
         Write-Host "[ClaudePlus] Installation de faster-whisper (premiere fois)..." -ForegroundColor Yellow
-
-        # Try with --break-system-packages first (Python 3.11+), then without
         $pipResult = & $py -m pip install faster-whisper --break-system-packages 2>&1
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "[ClaudePlus] Retry sans --break-system-packages..." -ForegroundColor DarkGray
             $pipResult = & $py -m pip install faster-whisper 2>&1
         }
-
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "[ClaudePlus] Pip output: $($pipResult | Out-String)" -ForegroundColor DarkGray
             Write-Host "[ClaudePlus] WARN: faster-whisper echoue, essai openai-whisper..." -ForegroundColor Yellow
-            $pipResult = & $py -m pip install openai-whisper 2>&1
+            & $py -m pip install openai-whisper --break-system-packages 2>&1 | Out-Null
         }
-
-        # Verify import
-        $checkWhisper = (& $py -c "import faster_whisper; print('ok')" 2>$null) | Select-Object -Last 1
-        $checkWhisper = "$checkWhisper".Trim()
-        if ($checkWhisper -ne "ok") {
-            # Check if openai-whisper was installed instead
-            $checkOpenai = (& $py -c "import whisper; print('ok')" 2>$null) | Select-Object -Last 1
-            $checkOpenai = "$checkOpenai".Trim()
-            if ($checkOpenai -eq "ok") {
-                $script:WhisperBackend = "openai"
-                Write-Host "[ClaudePlus] openai-whisper OK (fallback)" -ForegroundColor DarkGray
-            } else {
-                Write-Host "[ClaudePlus] Pip output: $($pipResult | Out-String)" -ForegroundColor Red
-                Write-Host "[ClaudePlus] ERREUR: Impossible d'installer whisper. Vocal desactive." -ForegroundColor Red
-                Write-Host "[ClaudePlus] Essayez manuellement: $py -m pip install faster-whisper" -ForegroundColor Yellow
-                return $false
-            }
-        } else {
-            $script:WhisperBackend = "faster"
-        }
-    } else {
-        $script:WhisperBackend = "faster"
     }
-    Write-Host "[ClaudePlus] Whisper OK (backend: $($script:WhisperBackend))" -ForegroundColor DarkGray
 
-    # Check ffmpeg (needed to decode OGG Opus from Telegram)
-    $ffmpegOk = $false
-    try {
-        $ffVer = & ffmpeg -version 2>&1
-        if ($ffVer -match "ffmpeg") { $ffmpegOk = $true }
-    } catch { }
+    # Check/install PyAV (decode OGG/Opus nativement, pas besoin de ffmpeg)
+    $checkAv = (& $py -c "import av; print('ok')" 2>$null) | Select-Object -Last 1
+    $checkAv = "$checkAv".Trim()
+    if ($checkAv -ne "ok") {
+        Write-Host "[ClaudePlus] Installation de PyAV (conversion audio OGG/Opus)..." -ForegroundColor Yellow
+        & $py -m pip install av --break-system-packages 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            & $py -m pip install av 2>&1 | Out-Null
+        }
+        $checkAv = (& $py -c "import av; print('ok')" 2>$null) | Select-Object -Last 1
+        $checkAv = "$checkAv".Trim()
+    }
+    if ($checkAv -eq "ok") {
+        Write-Host "[ClaudePlus] PyAV OK (conversion OGG/Opus native)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "[ClaudePlus] WARN: PyAV non installe — installation ffmpeg comme fallback..." -ForegroundColor Yellow
 
-    if (-not $ffmpegOk) {
-        Write-Host "[ClaudePlus] Installation de ffmpeg via winget..." -ForegroundColor Yellow
+        # Check/install ffmpeg as fallback for OGG/Opus decoding
+        $ffmpegOk = $false
         try {
-            & winget install Gyan.FFmpeg --accept-source-agreements --accept-package-agreements -q 2>&1 | Out-Null
-            # Refresh PATH
-            $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
             $ffVer = & ffmpeg -version 2>&1
             if ($ffVer -match "ffmpeg") { $ffmpegOk = $true }
         } catch { }
+
+        if (-not $ffmpegOk) {
+            Write-Host "[ClaudePlus] Installation de ffmpeg via winget..." -ForegroundColor Yellow
+            try {
+                $wingetResult = & winget install Gyan.FFmpeg --accept-source-agreements --accept-package-agreements -q 2>&1
+                # Refresh PATH after install
+                $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+                try {
+                    $ffVer = & ffmpeg -version 2>&1
+                    if ($ffVer -match "ffmpeg") { $ffmpegOk = $true }
+                } catch { }
+            } catch { }
+
+            if (-not $ffmpegOk) {
+                # Try chocolatey
+                try {
+                    $chocoPath = (Get-Command choco -ErrorAction SilentlyContinue).Source
+                    if ($chocoPath) {
+                        Write-Host "[ClaudePlus] Essai via chocolatey..." -ForegroundColor Yellow
+                        & choco install ffmpeg -y 2>&1 | Out-Null
+                        $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+                        try {
+                            $ffVer = & ffmpeg -version 2>&1
+                            if ($ffVer -match "ffmpeg") { $ffmpegOk = $true }
+                        } catch { }
+                    }
+                } catch { }
+            }
+        }
+
+        if ($ffmpegOk) {
+            Write-Host "[ClaudePlus] ffmpeg OK (fallback PyAV)" -ForegroundColor DarkGray
+        } else {
+            Write-Host "[ClaudePlus] WARN: ni PyAV ni ffmpeg disponible. Audio OGG/Opus peut echouer." -ForegroundColor Yellow
+            Write-Host "[ClaudePlus] Installez manuellement: winget install Gyan.FFmpeg" -ForegroundColor Yellow
+        }
     }
 
-    if (-not $ffmpegOk) {
-        Write-Host "[ClaudePlus] WARN: ffmpeg non trouve. Certains formats audio peuvent echouer." -ForegroundColor Yellow
-        Write-Host "[ClaudePlus] Installez ffmpeg: winget install Gyan.FFmpeg" -ForegroundColor Yellow
-    } else {
-        Write-Host "[ClaudePlus] ffmpeg OK" -ForegroundColor DarkGray
+    # Verify whisper availability
+    $whisperOk = $false
+    $checkFw = (& $py -c "import faster_whisper; print('ok')" 2>$null) | Select-Object -Last 1
+    if ("$checkFw".Trim() -eq "ok") { $whisperOk = $true; Write-Host "[ClaudePlus] faster-whisper OK" -ForegroundColor DarkGray }
+    else {
+        $checkOw = (& $py -c "import whisper; print('ok')" 2>$null) | Select-Object -Last 1
+        if ("$checkOw".Trim() -eq "ok") { $whisperOk = $true; Write-Host "[ClaudePlus] openai-whisper OK (fallback)" -ForegroundColor DarkGray }
+    }
+    if (-not $whisperOk) {
+        Write-Host "[ClaudePlus] ERREUR: Aucun moteur Whisper installe. Vocal desactive." -ForegroundColor Red
+        return $false
     }
 
     $script:PythonCmd = $py
     $script:TranscriptionReady = $true
 
-    # Create the transcription Python script (supports both backends)
-    $script:TranscribeScript = "$env:TEMP\claudeplus_transcribe.py"
-    $pyCode = @'
-import sys, json, os
+    # Use the FiscalIQ transcription script (PyAV + VAD + GPU auto-detect + retry logic)
+    $fiscalIqScript = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "FiscalIQ\wwwroot\scripts\transcribe_audio.py"
+    if (Test-Path $fiscalIqScript) {
+        $script:TranscribeScript = $fiscalIqScript
+        Write-Host "[ClaudePlus] Transcription: script FiscalIQ (PyAV + VAD + GPU)" -ForegroundColor Green
+    } else {
+        # Fallback: embedded script with same features
+        $script:TranscribeScript = "$env:TEMP\claudeplus_transcribe.py"
+        $pyCode = @'
+import sys, json, os, wave, shutil, subprocess
+
+def find_ffmpeg():
+    found = shutil.which('ffmpeg')
+    if found: return found
+    for c in [r'C:\ffmpeg-bin\ffmpeg.exe', r'C:\ffmpeg\bin\ffmpeg.exe', r'C:\Program Files\ffmpeg\bin\ffmpeg.exe', r'C:\ProgramData\chocolatey\bin\ffmpeg.exe']:
+        if os.path.isfile(c): return c
+    return None
+
+def convert_to_wav(input_path):
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext in ('.wav', '.wave'): return input_path
+    try:
+        import av
+        wav_path = input_path + ".converted.wav"
+        container = av.open(input_path)
+        resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
+        raw = bytearray()
+        for frame in container.decode(audio=0):
+            for f in resampler.resample(frame):
+                raw.extend(f.to_ndarray().tobytes())
+        container.close()
+        with wave.open(wav_path, 'w') as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000); wf.writeframes(bytes(raw))
+        return wav_path
+    except ImportError: pass
+    except Exception as e: sys.stderr.write(f"PyAV: {e}\n")
+    ffmpeg = find_ffmpeg()
+    if ffmpeg:
+        wav_path = input_path + ".ffmpeg.wav"
+        try:
+            r = subprocess.run([ffmpeg, '-y', '-i', input_path, '-ar', '16000', '-ac', '1', '-acodec', 'pcm_s16le', wav_path, '-loglevel', 'error'], capture_output=True, timeout=30)
+            if r.returncode == 0 and os.path.exists(wav_path): return wav_path
+        except: pass
+    return input_path
 
 audio_path = sys.argv[1]
-model_size = sys.argv[2] if len(sys.argv) > 2 else "base"
-backend = sys.argv[3] if len(sys.argv) > 3 else "faster"
+language = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "auto" else None
+wav_path = convert_to_wav(audio_path)
+converted = wav_path != audio_path
 
-if backend == "faster":
-    from faster_whisper import WhisperModel
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segments, info = model.transcribe(audio_path, beam_size=5)
-    text = " ".join([s.text.strip() for s in segments])
-    result = {"text": text, "language": info.language, "probability": round(info.language_probability, 2)}
-else:
-    import whisper
-    model = whisper.load_model(model_size)
-    out = model.transcribe(audio_path)
-    result = {"text": out["text"].strip(), "language": out.get("language", "?"), "probability": 0.99}
-
-print(json.dumps(result, ensure_ascii=False))
+try:
+    try:
+        from faster_whisper import WhisperModel
+        device, compute = "cpu", "int8"
+        try:
+            import torch
+            if torch.cuda.is_available(): device, compute = "cuda", "float16"
+        except: pass
+        model = WhisperModel("base", device=device, compute_type=compute)
+        segments, info = model.transcribe(wav_path, language=language, beam_size=5, vad_filter=True)
+        text = " ".join(s.text for s in segments).strip()
+        if not text:
+            segments, info = model.transcribe(wav_path, language=language, beam_size=5, vad_filter=False)
+            text = " ".join(s.text for s in segments).strip()
+        print(json.dumps({"text": text, "language": info.language, "provider": "faster-whisper"}, ensure_ascii=False))
+        sys.exit(0)
+    except ImportError: pass
+    try:
+        import whisper
+        model = whisper.load_model("base")
+        opts = {"language": language} if language else {}
+        result = model.transcribe(wav_path, **opts)
+        print(json.dumps({"text": result["text"].strip(), "language": result.get("language",""), "provider": "openai-whisper"}, ensure_ascii=False))
+        sys.exit(0)
+    except ImportError: pass
+    print(json.dumps({"error": "Aucun moteur Whisper disponible"}))
+finally:
+    if converted and os.path.exists(wav_path):
+        try: os.unlink(wav_path)
+        except: pass
 '@
-    [System.IO.File]::WriteAllText($script:TranscribeScript, $pyCode, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($script:TranscribeScript, $pyCode, [System.Text.Encoding]::UTF8)
+        Write-Host "[ClaudePlus] Transcription: script embarque (PyAV + VAD + GPU)" -ForegroundColor Green
+    }
 
     Write-Host "[ClaudePlus] Transcription vocale prete (auto-detection langue, 99+ langues)" -ForegroundColor Green
     return $true
+}
+
+function Download-TelegramFile {
+    param(
+        [string]$FileId,
+        [string]$Token,
+        [string]$OutputPath
+    )
+    try {
+        $fileInfo = Invoke-RestMethod -Uri "https://api.telegram.org/bot$Token/getFile?file_id=$FileId" -Method Get -TimeoutSec 10
+        if (-not $fileInfo.ok) {
+            Write-Host "[ClaudePlus] Erreur getFile Telegram" -ForegroundColor Red
+            return $null
+        }
+        $filePath = $fileInfo.result.file_path
+        $downloadUrl = "https://api.telegram.org/file/bot$Token/$filePath"
+
+        # Determine output path from Telegram filename if not specified
+        if (-not $OutputPath) {
+            $ext = [System.IO.Path]::GetExtension($filePath)
+            if (-not $ext) { $ext = ".bin" }
+            $OutputPath = "$env:TEMP\claudeplus_file_$(Get-Random)$ext"
+        }
+
+        Write-Host "[ClaudePlus] Telechargement: $filePath" -ForegroundColor DarkGray
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $OutputPath -TimeoutSec 30 -ErrorAction Stop
+
+        if (Test-Path $OutputPath) {
+            $fileSize = [Math]::Round((Get-Item $OutputPath).Length / 1024, 1)
+            Write-Host "[ClaudePlus] Fichier telecharge: $OutputPath ($fileSize KB)" -ForegroundColor DarkGray
+            return $OutputPath
+        }
+        return $null
+    } catch {
+        Write-Host "[ClaudePlus] Erreur telechargement: $_" -ForegroundColor Red
+        return $null
+    }
 }
 
 function Transcribe-TelegramAudio {
@@ -748,11 +882,10 @@ function Transcribe-TelegramAudio {
         $fileSize = [Math]::Round((Get-Item $audioFile).Length / 1024, 1)
         Write-Host "[ClaudePlus] Audio telecharge ($fileSize KB), transcription en cours..." -ForegroundColor DarkCyan
 
-        # Step 3: Transcribe with faster-whisper
+        # Step 3: Transcribe with FiscalIQ-style script (PyAV + VAD + GPU + retry)
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $script:PythonCmd
-        $backend = if ($script:WhisperBackend) { $script:WhisperBackend } else { "faster" }
-        $psi.Arguments = "`"$($script:TranscribeScript)`" `"$audioFile`" `"$ModelSize`" `"$backend`""
+        $psi.Arguments = "`"$($script:TranscribeScript)`" `"$audioFile`""
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
         $psi.RedirectStandardOutput = $true
@@ -782,9 +915,16 @@ function Transcribe-TelegramAudio {
             return $null
         }
 
-        # Parse JSON result
+        # Parse JSON result (FiscalIQ format: text, language, provider)
         $result = $stdout.Trim() | ConvertFrom-Json
-        Write-Host "[ClaudePlus] Transcription OK: [$($result.language) $($result.probability * 100)%] $($result.text)" -ForegroundColor Green
+        if ($result.error) {
+            Write-Host "[ClaudePlus] Transcription erreur: $($result.error)" -ForegroundColor Red
+            return $null
+        }
+        # Add probability field for compatibility (FiscalIQ script doesn't include it)
+        if (-not $result.probability) { $result | Add-Member -NotePropertyName "probability" -NotePropertyValue 0.95 -ErrorAction SilentlyContinue }
+        $provider = if ($result.provider) { $result.provider } else { "whisper" }
+        Write-Host "[ClaudePlus] Transcription OK ($provider): [$($result.language)] $($result.text)" -ForegroundColor Green
         return $result
 
     } catch {
@@ -860,8 +1000,30 @@ function Invoke-ClaudePipe {
         [switch]$Continue,
         [switch]$DangerouslySkipPermissions,
         [string]$TelegramToken,
-        [string]$TelegramChatId
+        [string]$TelegramChatId,
+        [string]$SessionName,
+        [string[]]$ImagePaths
     )
+
+    # If images are attached, copy them to workdir and add paths to the message
+    if ($ImagePaths -and $ImagePaths.Count -gt 0) {
+        $fileRefs = @()
+        foreach ($imgPath in $ImagePaths) {
+            if (Test-Path $imgPath) {
+                $destName = "telegram_$(Split-Path -Leaf $imgPath)"
+                $destPath = Join-Path $WorkDir $destName
+                Copy-Item -Path $imgPath -Destination $destPath -Force -ErrorAction SilentlyContinue
+                if (Test-Path $destPath) {
+                    $fileRefs += $destPath
+                    Write-Host "[ClaudePlus] Image copiee: $destPath" -ForegroundColor DarkGray
+                }
+            }
+        }
+        if ($fileRefs.Count -gt 0) {
+            $fileList = ($fileRefs | ForEach-Object { "`"$_`"" }) -join ", "
+            $Message = "$Message`n`n[Image(s) jointe(s) — utilise l'outil Read pour les voir: $fileList]"
+        }
+    }
 
     $escapedMsg = $Message -replace '"', '\"'
     $argList = @("-p", "`"$escapedMsg`"", "--output-format", "stream-json", "--verbose")
@@ -982,6 +1144,17 @@ function Invoke-ClaudePipe {
             if (-not $detectedTool -and $event.tool_use -and $event.tool_use.name) { $detectedTool = $event.tool_use.name }
             # Format F: Claude Code subagent {"type":"system","subtype":"tool_use",...,"tool":{"name":"Read"}}
             if (-not $detectedTool -and $event.subtype -eq "tool_use" -and $event.tool -and $event.tool.name) { $detectedTool = $event.tool.name }
+            # Format G: Claude Code CLI stream-json {"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{...}}]}}
+            if (-not $detectedTool -and $event.message -and $event.message.content) {
+                foreach ($block in $event.message.content) {
+                    if ($block.type -eq "tool_use" -and $block.name) {
+                        $detectedTool = $block.name
+                        # Also extract input from this block directly
+                        if (-not $toolInput -and $block.input) { $toolInput = $block.input }
+                        break
+                    }
+                }
+            }
 
             if ($detectedTool) {
                 $toolCount++
@@ -995,16 +1168,22 @@ function Invoke-ClaudePipe {
                 if (-not $toolInput -and $event.input) { $toolInput = $event.input }
                 if (-not $toolInput -and $event.tool_use -and $event.tool_use.input) { $toolInput = $event.tool_use.input }
                 if (-not $toolInput -and $event.tool -and $event.tool.input) { $toolInput = $event.tool.input }
+                # Format G: input from message.content[].input
+                if (-not $toolInput -and $event.message -and $event.message.content) {
+                    foreach ($block in $event.message.content) {
+                        if ($block.type -eq "tool_use" -and $block.input) { $toolInput = $block.input; break }
+                    }
+                }
 
                 if ($toolInput) {
-                    $preview = $toolInput.pattern
-                    if (-not $preview) { $preview = $toolInput.command }
+                    $preview = $toolInput.command
+                    if (-not $preview) { $preview = $toolInput.pattern }
                     if (-not $preview) { $preview = $toolInput.file_path }
                     if (-not $preview) { $preview = $toolInput.path }
                     if (-not $preview) { $preview = $toolInput.description }
                     if (-not $preview) { $preview = $toolInput.query }
                     if ($preview) {
-                        if ($preview.Length -gt 50) { $preview = $preview.Substring(0, 47) + "..." }
+                        if ($preview.Length -gt 120) { $preview = $preview.Substring(0, 117) + "..." }
                         $inputPreview = ": $preview"
                     }
                 }
@@ -1013,17 +1192,33 @@ function Invoke-ClaudePipe {
                 $toolsUsed += $toolDisplay
                 Write-Host "[ClaudePlus] Stream: Tool #$toolCount -> $detectedTool$inputPreview" -ForegroundColor Magenta
 
-                # Throttled Telegram progress update
+                # Throttled Telegram progress update (verbose mode only)
                 $now = Get-Date
                 $elapsed = [int]($now - $startTime).TotalSeconds
-                if ($TelegramToken -and $TelegramChatId) {
+                if ($script:TelegramVerbose -and $TelegramToken -and $TelegramChatId) {
                     $secsSinceUpdate = ($now - $lastTelegramUpdate).TotalSeconds
                     if ($secsSinceUpdate -ge $telegramUpdateInterval -or $toolCount -eq 1) {
-                        $progressMsg = "$([char]0x23F3) Claude travaille... (${elapsed}s)`n"
+                        $tag = if ($SessionName) { "@${SessionName} : " } else { "" }
+                        $progressMsg = "${tag}$([char]0x23F3) Claude travaille... (${elapsed}s)`n"
                         foreach ($t in $toolsUsed) { $progressMsg += "  $t`n" }
                         Send-TelegramMessage -Message $progressMsg.TrimEnd() -Token $TelegramToken -ChatId $TelegramChatId
                         $lastTelegramUpdate = $now
                     }
+                }
+            }
+
+            # --- DETECT TOOL RESULT (capture output for Telegram) ---
+            if ($event.type -eq "tool_result" -or $event.subtype -eq "tool_result") {
+                $resultContent = $null
+                if ($event.content -and $event.content -is [string]) { $resultContent = $event.content }
+                elseif ($event.output -and $event.output -is [string]) { $resultContent = $event.output }
+                elseif ($event.result -and $event.result -is [string] -and $event.type -ne "result") { $resultContent = $event.result }
+                if ($resultContent -and $resultContent.Length -gt 0) {
+                    $resultPreview = if ($resultContent.Length -gt 200) { $resultContent.Substring(0, 197) + "..." } else { $resultContent }
+                    # Clean newlines for Telegram
+                    $resultPreview = $resultPreview -replace "`r`n", "`n"
+                    $toolsUsed += "  $([char]0x2192) $resultPreview"
+                    Write-Host "[ClaudePlus] Stream: ToolResult ($($resultContent.Length) chars)" -ForegroundColor DarkMagenta
                 }
             }
 
@@ -1049,7 +1244,8 @@ function Invoke-ClaudePipe {
                 }
             }
             # Format E: {"type":"result","result":"Hello full response"}
-            elseif ($event.type -eq "result" -and $event.result) {
+            # ONLY use result if we haven't captured text from assistant/message (avoids duplication)
+            elseif ($event.type -eq "result" -and $event.result -and $textBuilder.Length -eq 0) {
                 [void]$textBuilder.Append($event.result)
             }
             # Format F: {"content":"Hello"} or {"response":"Hello"}
@@ -1076,12 +1272,18 @@ function Invoke-ClaudePipe {
             Write-Host "[ClaudePlus] Stream stderr: $stderrPreview" -ForegroundColor DarkGray
         }
 
-        # Send final progress summary if tools were used
-        if ($TelegramToken -and $TelegramChatId -and $toolCount -gt 0) {
-            $summaryMsg = "$([char]0x2705) Termine (${elapsed}s, $toolCount outils)`n"
+        # Send final progress summary if tools were used (verbose mode only)
+        if ($script:TelegramVerbose -and $TelegramToken -and $TelegramChatId -and $toolCount -gt 0) {
+            $tag = if ($SessionName) { "@${SessionName} : " } else { "" }
+            $summaryMsg = "${tag}$([char]0x2705) Termine (${elapsed}s, $toolCount outils)`n"
             foreach ($t in $toolsUsed) { $summaryMsg += "  $t`n" }
             Send-TelegramMessage -Message $summaryMsg.TrimEnd() -Token $TelegramToken -ChatId $TelegramChatId
         }
+
+        # Save tools info for the caller to include in Telegram
+        $script:LastPipeTools = $toolsUsed
+        $script:LastPipeToolCount = $toolCount
+        $script:LastPipeElapsed = $elapsed
 
         $result = $textBuilder.ToString().Trim()
         if ($result.Length -gt 0) {
@@ -1186,180 +1388,96 @@ function Invoke-ClaudePipePlain {
 function Send-TextToClaude {
     param([string]$Text)
 
-    # Find window handle if needed
-    if (-not $script:ClaudeWindowHandle -or $script:ClaudeWindowHandle -eq [IntPtr]::Zero) {
-        if ($script:ClaudeCmdPid -gt 0) {
-            $script:ClaudeWindowHandle = Get-WindowHandleForPid -Pid1 $script:ClaudeCmdPid
-        }
-    }
-
-    $hwnd = $script:ClaudeWindowHandle
-    if (-not $hwnd -or $hwnd -eq [IntPtr]::Zero) {
-        Write-Host "[ClaudePlus] ERREUR: Handle fenetre introuvable" -ForegroundColor Red
-        return $false
-    }
-
-    $mode = if ($script:UsesWindowsTerminal) { "SendInput" } else { "PostMessage" }
-    Write-Host "[ClaudePlus] Envoi via $mode vers hwnd=$hwnd..." -ForegroundColor DarkGray
+    Write-Host "[ClaudePlus] Envoi texte au terminal..." -ForegroundColor DarkGray
 
     try {
-        $csFile = "$env:TEMP\claudeplus_poster.cs"
+        # Escape SendKeys special characters: + ^ % ~ { } [ ] ( )
+        $escaped = $Text -replace '([+^%~\{\}\[\]\(\)])', '{$1}'
 
-        if ($script:UsesWindowsTerminal) {
-            # SendInput approach — simulates real keyboard input
-            # Required for Windows Terminal (GPU-rendered, ignores PostMessage)
-            $csCode = @"
-using System;
-using System.Runtime.InteropServices;
-using System.Threading;
-public class ConPoster {
-    [StructLayout(LayoutKind.Sequential)] public struct INPUT {
-        public uint type;
-        public INPUTUNION data;
-    }
-    [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION {
-        [FieldOffset(0)] public KEYBDINPUT ki;
-    }
-    [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT {
-        public ushort wVk;
-        public ushort wScan;
-        public uint dwFlags;
-        public uint time;
-        public IntPtr dwExtraInfo;
-    }
-    const uint INPUT_KEYBOARD = 1;
-    const uint KEYEVENTF_UNICODE = 0x0004;
-    const uint KEYEVENTF_KEYUP = 0x0002;
-    const int VK_RETURN = 0x0D;
-    [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
-    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
-    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int cmd);
-    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hwnd);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr pid);
-    [DllImport("user32.dll")] static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
-    static void SendChar(char c) {
-        var down = new INPUT { type = INPUT_KEYBOARD };
-        down.data.ki.wScan = (ushort)c;
-        down.data.ki.dwFlags = KEYEVENTF_UNICODE;
-        var up = new INPUT { type = INPUT_KEYBOARD };
-        up.data.ki.wScan = (ushort)c;
-        up.data.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        SendInput(2, new INPUT[] { down, up }, Marshal.SizeOf(typeof(INPUT)));
-    }
-    static void SendVK(ushort vk) {
-        var down = new INPUT { type = INPUT_KEYBOARD };
-        down.data.ki.wVk = vk;
-        var up = new INPUT { type = INPUT_KEYBOARD };
-        up.data.ki.wVk = vk;
-        up.data.ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(2, new INPUT[] { down, up }, Marshal.SizeOf(typeof(INPUT)));
-    }
-    public static string Send(long hwnd, string text) {
-        var h = new IntPtr(hwnd);
-        try {
-            ShowWindow(h, 9);
-            BringWindowToTop(h);
-            uint wndThread = GetWindowThreadProcessId(h, IntPtr.Zero);
-            uint curThread = GetCurrentThreadId();
-            AttachThreadInput(curThread, wndThread, true);
-            SetForegroundWindow(h);
-            AttachThreadInput(curThread, wndThread, false);
-        } catch {}
-        Thread.Sleep(500);
-        int n = 0;
-        foreach (char c in text) {
-            SendChar(c);
-            Thread.Sleep(20);
-            n++;
-        }
-        Thread.Sleep(150);
-        SendVK((ushort)VK_RETURN);
-        return "OK:sent=" + n;
-    }
-}
-"@
-        } else {
-            # PostMessage approach — works with conhost.exe (no focus stealing)
-            $csCode = @"
-using System;
-using System.Runtime.InteropServices;
-using System.Threading;
-public class ConPoster {
-    const uint WM_CHAR    = 0x0102;
-    const uint WM_KEYDOWN = 0x0100;
-    const uint WM_KEYUP   = 0x0101;
-    const int  VK_RETURN  = 0x0D;
-    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
-    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
-    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int cmd);
-    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hwnd);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr pid);
-    [DllImport("user32.dll")] static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
-    public static string Send(long hwnd, string text) {
-        var h = new IntPtr(hwnd);
-        try {
-            ShowWindow(h, 9);
-            BringWindowToTop(h);
-            uint wndThread = GetWindowThreadProcessId(h, IntPtr.Zero);
-            uint curThread = GetCurrentThreadId();
-            AttachThreadInput(curThread, wndThread, true);
-            SetForegroundWindow(h);
-            AttachThreadInput(curThread, wndThread, false);
-        } catch {}
-        Thread.Sleep(400);
-        int n = 0;
-        foreach (char c in text) {
-            PostMessage(h, WM_CHAR, (IntPtr)c, (IntPtr)1);
-            Thread.Sleep(30);
-            n++;
-        }
-        Thread.Sleep(150);
-        PostMessage(h, WM_KEYDOWN, (IntPtr)VK_RETURN, (IntPtr)1);
-        Thread.Sleep(30);
-        PostMessage(h, WM_KEYUP,   (IntPtr)VK_RETURN, (IntPtr)1);
-        return "OK:sent=" + n;
-    }
-}
-"@
-        }
+        $helperScript = "$env:TEMP\claudeplus_sendkeys.ps1"
         $textFile = "$env:TEMP\claudeplus_sendtext.txt"
-        $logFile  = "$textFile.log"
-        [System.IO.File]::WriteAllText($csFile, $csCode, [System.Text.Encoding]::UTF8)
-        [System.IO.File]::WriteAllText($textFile, $Text, [System.Text.Encoding]::UTF8)
+        $logFile = "$env:TEMP\claudeplus_sendkeys.log"
+        $csFile = "$env:TEMP\claudeplus_winfocus.cs"
+        [System.IO.File]::WriteAllText($textFile, $escaped, [System.Text.Encoding]::UTF8)
         if (Test-Path $logFile) { Remove-Item $logFile -ErrorAction SilentlyContinue }
 
-        $hwndLong = [long]$hwnd
-        $helperScript = "$env:TEMP\claudeplus_poster.ps1"
-        $helperLines = @(
-            'param([long]$Hwnd, [string]$TextFile, [string]$CsFile, [string]$LogFile)',
-            'try {',
-            '    $text = [System.IO.File]::ReadAllText($TextFile, [System.Text.Encoding]::UTF8)',
-            '    Add-Type -Path $CsFile -ErrorAction Stop',
-            '    $result = [ConPoster]::Send($Hwnd, $text)',
-            '    [System.IO.File]::WriteAllText($LogFile, "Result=$result")',
-            '} catch {',
-            '    [System.IO.File]::WriteAllText($LogFile, "EXCEPTION: $_")',
-            '}'
-        )
-        [System.IO.File]::WriteAllText($helperScript, ($helperLines -join "`r`n"), [System.Text.Encoding]::UTF8)
+        # Write C# code to a separate file (no here-string nesting, no C# 7 syntax)
+        $csCode = @'
+using System;
+using System.Runtime.InteropServices;
+public class WinFocus2 {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    public static void ForceForeground(IntPtr targetHwnd) {
+        IntPtr foreHwnd = GetForegroundWindow();
+        uint dummy;
+        uint foreThread = GetWindowThreadProcessId(foreHwnd, out dummy);
+        uint curThread = GetCurrentThreadId();
+        if (foreThread != curThread) {
+            AttachThreadInput(curThread, foreThread, true);
+            SetForegroundWindow(targetHwnd);
+            BringWindowToTop(targetHwnd);
+            AttachThreadInput(curThread, foreThread, false);
+        } else {
+            SetForegroundWindow(targetHwnd);
+            BringWindowToTop(targetHwnd);
+        }
+    }
+}
+'@
+        [System.IO.File]::WriteAllText($csFile, $csCode, [System.Text.Encoding]::UTF8)
 
-        $argStr = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$helperScript`" -Hwnd $hwndLong -TextFile `"$textFile`" -CsFile `"$csFile`" -LogFile `"$logFile`""
-        $proc = Start-Process -FilePath "powershell.exe" -ArgumentList $argStr -PassThru -WindowStyle Hidden
-        $proc.WaitForExit(15000) | Out-Null
-        if (-not $proc.HasExited) { $proc.Kill() }
+        # Write the helper PowerShell script (no nested here-strings)
+        $helperCode = @'
+param([string]$TextFile, [string]$LogFile, [long]$Hwnd, [string]$CsFile)
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    $csCode = [System.IO.File]::ReadAllText($CsFile, [System.Text.Encoding]::UTF8)
+    Add-Type -TypeDefinition $csCode
+    $text = [System.IO.File]::ReadAllText($TextFile, [System.Text.Encoding]::UTF8)
+    $h = [IntPtr]::new($Hwnd)
+    [WinFocus2]::ShowWindow($h, 9) | Out-Null
+    Start-Sleep -Milliseconds 150
+    [WinFocus2]::ForceForeground($h)
+    Start-Sleep -Milliseconds 500
+    $fgNow = [WinFocus2]::GetForegroundWindow()
+    $gotFocus = ($fgNow -eq $h)
+    [System.Windows.Forms.SendKeys]::SendWait($text)
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    [System.IO.File]::WriteAllText($LogFile, "OK:SendKeys:len=$($text.Length):hwnd=$Hwnd:focus=$gotFocus:fg=$fgNow")
+} catch {
+    [System.IO.File]::WriteAllText($LogFile, "EXCEPTION: $_")
+}
+'@
+        [System.IO.File]::WriteAllText($helperScript, $helperCode, [System.Text.Encoding]::UTF8)
+
+        $hwndLong = [long]$script:ClaudeWindowHandle
+        Write-Host "[ClaudePlus] SendKeys vers hwnd=$hwndLong (AttachThread)..." -ForegroundColor DarkGray
+
+        # Run helper minimized — Hidden blocks SetForegroundWindow, Normal flashes a black window
+        # Minimized = window exists (so Win32 focus APIs work) but no visible flash
+        $argStr = "-NoProfile -STA -ExecutionPolicy Bypass -File `"$helperScript`" -TextFile `"$textFile`" -LogFile `"$logFile`" -Hwnd $hwndLong -CsFile `"$csFile`""
+        $proc = Start-Process -FilePath "powershell.exe" -ArgumentList $argStr -PassThru -WindowStyle Minimized
+        # Short timeout — don't block Telegram response
+        $proc.WaitForExit(8000) | Out-Null
+        if (-not $proc.HasExited) { try { $proc.Kill() } catch {} }
 
         if (Test-Path $logFile) {
             $logContent = [System.IO.File]::ReadAllText($logFile)
             Write-Host "[ClaudePlus] Send result: $logContent" -ForegroundColor DarkGray
             Remove-Item $logFile -ErrorAction SilentlyContinue
-            if ($logContent -match "^Result=OK") { return $true }
+            if ($logContent -match "^OK") { return $true }
         } else {
-            Write-Host "[ClaudePlus] Pas de log (process crash?)" -ForegroundColor Red
+            Write-Host "[ClaudePlus] Send: pas de log (timeout?)" -ForegroundColor Yellow
         }
     } catch {
-        Write-Host "[ClaudePlus] Erreur send: $_" -ForegroundColor Red
+        Write-Host "[ClaudePlus] Send erreur: $_" -ForegroundColor Yellow
     }
 
     return $false
@@ -1397,15 +1515,29 @@ function Unregister-Session {
     if (Test-Path $sessionFile) {
         Remove-Item $sessionFile -ErrorAction SilentlyContinue
     }
+    # Clean up dispatch file for this session
+    $dispatchFile = Join-Path $script:SessionRegistryDir "dispatch_$($Name.ToLower()).json"
+    if (Test-Path $dispatchFile) { Remove-Item $dispatchFile -ErrorAction SilentlyContinue }
+    # If no more active sessions, clean up shared pending files
+    $remaining = Get-ActiveSessions
+    if ($remaining.Count -eq 0) {
+        $pendingMsg = Join-Path $script:SessionRegistryDir "pending_message.json"
+        $pendingChoice = Join-Path $script:SessionRegistryDir "pending_choice.json"
+        if (Test-Path $pendingMsg) { Remove-Item $pendingMsg -ErrorAction SilentlyContinue }
+        if (Test-Path $pendingChoice) { Remove-Item $pendingChoice -ErrorAction SilentlyContinue }
+    }
 }
 
 function Get-ActiveSessions {
     if (-not (Test-Path $script:SessionRegistryDir)) { return @() }
     $sessions = @()
     Get-ChildItem -Path $script:SessionRegistryDir -Filter "*.json" -ErrorAction SilentlyContinue | ForEach-Object {
+        # Skip non-session files (dispatch, pending, choice files)
+        if ($_.Name -match '^(dispatch_|pending_)') { return }
         try {
             $data = Get-Content $_.FullName -Raw | ConvertFrom-Json
             # Check if process is still alive
+            if (-not $data.Pid) { return }  # Not a session file
             $proc = Get-Process -Id $data.Pid -ErrorAction SilentlyContinue
             if ($proc) {
                 $sessions += $data
@@ -1421,60 +1553,219 @@ function Get-ActiveSessions {
 }
 
 # Parse @prefix from message. Returns @{Target="name"; Text="actual message"} or @{Target=$null; Text="original"}
+# Supports: @name : message, @name: message, @name:message, @name message
 function Parse-MessageTarget {
     param([string]$Message)
-    if ($Message -match '^@(\S+)\s+(.+)$') {
+    # Support: @nom : msg, @nom1,nom2 : msg, @all : msg, @nom msg, @nom
+    # With commas: target may contain commas for multi-session (colon required)
+    # Format: @target : message  (colon separator, target may contain commas/spaces)
+    if ($Message -match '^@([a-zA-Z0-9_,\s-]+?)\s*:\s*(.+)$') {
+        $rawTarget = $Matches[1].Trim().ToLower()
+        return @{ Target = $rawTarget; Text = $Matches[2].Trim() }
+    }
+    # Format: @name message (space separator, no colon — single name only)
+    if ($Message -match '^@([a-zA-Z0-9_-]+)\s+(.+)$') {
         return @{ Target = $Matches[1].ToLower(); Text = $Matches[2] }
     }
-    if ($Message -match '^@(\S+)$') {
-        # Just "@name" with no message — ignore
-        return @{ Target = $Matches[1].ToLower(); Text = "" }
+    # Format: @target (just the target, no message — may contain commas)
+    if ($Message -match '^@([a-zA-Z0-9_,\s-]+?)\s*:?\s*$') {
+        $rawTarget = $Matches[1].Trim().ToLower()
+        return @{ Target = $rawTarget; Text = "" }
     }
     return @{ Target = $null; Text = $Message }
+}
+
+# Parse command parameters: /cmd name1, name2  OR  /cmd name  OR  /cmd (no param = all)
+# Returns: @{ Command = "/stop"; Targets = @("fiscal","option1") }  or Targets = @() for all
+function Parse-CommandTargets {
+    param([string]$CommandText)
+    # Match: /command  optionalparams
+    if ($CommandText -match '^(/\w+)\s*(.*)$') {
+        $cmd = $Matches[1].ToLower()
+        $paramStr = $Matches[2].Trim()
+        if (-not $paramStr) {
+            return @{ Command = $cmd; Targets = @() }  # No param = apply to all
+        }
+        # Split by comma, trim spaces, lowercase
+        $targets = @($paramStr -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_.Length -gt 0 })
+        return @{ Command = $cmd; Targets = $targets }
+    }
+    return @{ Command = $CommandText.ToLower(); Targets = @() }
+}
+
+# Check if this session is targeted by a command's parameters
+# Supports exact match and partial match (e.g., "fis" matches "fiscaliq")
+function Test-CommandTargetsMe {
+    param([string[]]$Targets)
+    $myName = $script:SessionName
+    if (-not $myName) { return $false }
+    $myNameLower = $myName.ToLower()
+
+    # No targets specified = command applies to ALL sessions
+    if (-not $Targets -or $Targets.Count -eq 0) { return $true }
+
+    foreach ($t in $Targets) {
+        # Exact match
+        if ($t -eq $myNameLower) { return $true }
+        # Partial match: target is prefix of my name (e.g., "fis" matches "fiscaliq")
+        if ($myNameLower.StartsWith($t)) { return $true }
+        # Partial match: my name is prefix of target (e.g., "fiscaliq" matches "fiscaliqpro")
+        if ($t.StartsWith($myNameLower)) { return $true }
+    }
+    return $false
+}
+
+# Send numbered session choice list to Telegram
+function Send-SessionChoiceList {
+    param(
+        [string]$Token,
+        [string]$ChatId,
+        [string]$MessagePreview
+    )
+    $sessions = Get-ActiveSessions | Sort-Object { $_.Name }
+    $script:SessionChoiceMap = @{}
+
+    $msg = "$([char]0x2753) Plusieurs sessions actives.`n"
+    if ($MessagePreview) {
+        $preview = if ($MessagePreview.Length -gt 50) { $MessagePreview.Substring(0, 47) + "..." } else { $MessagePreview }
+        $msg += "Message : $preview`n"
+    }
+    $msg += "`nChoisissez la destination :`n"
+    $i = 1
+    foreach ($s in $sessions) {
+        $dir = Split-Path -Leaf $s.WorkDir
+        $msg += "`n  $i. @$($s.Name) ($dir)"
+        $script:SessionChoiceMap[$i] = $s.Name
+        $i++
+    }
+    $msg += "`n  0. Toutes les sessions"
+    $msg += "`n`nTapez le numero (ex: 1 ou 1,2,3 ou 0)"
+    $msg += "`nAnnulation auto dans 60s."
+
+    Send-TelegramMessage -Message $msg -Token $Token -ChatId $ChatId
+
+    # Write pending_choice.json with the session map so ANY session can resolve the choice
+    $pendingFile = Join-Path $script:SessionRegistryDir "pending_choice.json"
+    $choiceMapForJson = @{}
+    foreach ($key in $script:SessionChoiceMap.Keys) {
+        $choiceMapForJson["$key"] = $script:SessionChoiceMap[$key]
+    }
+    @{
+        Timestamp = (Get-Date).ToString("o")
+        SenderPid = $PID
+        SessionChoiceMap = $choiceMapForJson
+    } | ConvertTo-Json | Set-Content -Path $pendingFile -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+# Resolve user's number input to session names
+# Input: "1" or "1,2,3" or "1, 2, 3" or "1 2 3" or "0"
+# Returns: array of session names, or $null if invalid
+function Resolve-SessionChoice {
+    param([string]$UserInput)
+
+    $numbers = @($UserInput -split '[,\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
+    if ($numbers.Count -eq 0) { return $null }
+
+    # 0 = all sessions
+    if (0 -in $numbers) {
+        $sessions = Get-ActiveSessions
+        return @($sessions | ForEach-Object { $_.Name.ToLower() })
+    }
+
+    # Resolve each number
+    $names = @()
+    foreach ($n in $numbers) {
+        if ($script:SessionChoiceMap.ContainsKey($n)) {
+            $name = $script:SessionChoiceMap[$n]
+            if ($name -and $name -notin $names) { $names += $name.ToLower() }
+        } else {
+            return $null  # Invalid number found
+        }
+    }
+    if ($names.Count -eq 0) { return $null }
+    return $names
+}
+
+# Write a dispatch file for another session to pick up
+function ConvertTo-SafeJsonString {
+    param([string]$Value)
+    if (-not $Value) { return "" }
+    $s = $Value -replace '\\', '\\' -replace '"', '\"'
+    $s = $s -replace "`r`n", '\n' -replace "`n", '\n' -replace "`r", ''
+    return $s
+}
+
+function ConvertTo-SafeJsonPathArray {
+    # Returns a JSON array string like: ["c:\\path1","c:\\path2"] or []
+    # Only includes paths that actually exist on disk
+    param([object[]]$Paths)
+    $valid = [System.Collections.Generic.List[string]]::new()
+    if ($Paths) {
+        foreach ($p in $Paths) {
+            if ($p -eq $null) { continue }
+            $ps = "$p"
+            if ($ps.Length -gt 2 -and (Test-Path $ps -ErrorAction SilentlyContinue)) {
+                $escaped = ConvertTo-SafeJsonString -Value $ps
+                $valid.Add('"' + $escaped + '"')
+            }
+        }
+    }
+    if ($valid.Count -gt 0) { return '[' + ($valid -join ',') + ']' }
+    return '[]'
+}
+
+function Write-DispatchFile {
+    param(
+        [string]$TargetSessionName,
+        [string]$Text,
+        [string[]]$ImagePaths,
+        [string[]]$FilePaths
+    )
+    $dispatchFile = Join-Path $script:SessionRegistryDir "dispatch_$($TargetSessionName.ToLower()).json"
+    $safeText = ConvertTo-SafeJsonString -Value $Text
+    $imgArr = ConvertTo-SafeJsonPathArray -Paths $ImagePaths
+    $fileArr = ConvertTo-SafeJsonPathArray -Paths $FilePaths
+    $ts = (Get-Date).ToString("o")
+    $json = '{"Text":"' + $safeText + '","ImagePaths":' + $imgArr + ',"FilePaths":' + $fileArr + ',"Timestamp":"' + $ts + '"}'
+    Set-Content -Path $dispatchFile -Value $json -Encoding UTF8 -ErrorAction SilentlyContinue
 }
 
 # Check if this session should handle the message
 function Test-MessageForMe {
     param([string]$RawText)
 
-    $parsed = Parse-MessageTarget -Message $RawText
+    # Commands: /stop, /list, /help, /verbose, /quiet
+    if ($RawText -match '^/(stop|list|sessions|help|aide|verbose|quiet)') {
+        $cmdParsed = Parse-CommandTargets -CommandText $RawText
+        $activeSessions = Get-ActiveSessions
 
-    # Commands like /stop, /list are always handled by everyone
-    if ($parsed.Text -match '^/(stop|list|sessions|help)') {
-        return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $true }
+        # /list and /help are always handled by ONE session (lowest PID) to avoid duplicates
+        if ($cmdParsed.Command -in @('/list', '/sessions', '/help', '/aide')) {
+            $minPid = ($activeSessions | Sort-Object { [int]$_.Pid } | Select-Object -First 1).Pid
+            if ($activeSessions.Count -le 1 -or [int]$minPid -eq $PID) {
+                return @{ ShouldHandle = $true; Text = $RawText; IsCommand = $true; CommandTargets = $cmdParsed.Targets }
+            }
+            return @{ ShouldHandle = $false; Text = ""; IsCommand = $true; CommandTargets = @() }
+        }
+
+        # /stop, /verbose, /quiet: check if targets include me
+        if ($activeSessions.Count -le 1) {
+            return @{ ShouldHandle = $true; Text = $RawText; IsCommand = $true; CommandTargets = $cmdParsed.Targets }
+        }
+        $targetsMe = Test-CommandTargetsMe -Targets $cmdParsed.Targets
+        return @{ ShouldHandle = $targetsMe; Text = $RawText; IsCommand = $true; CommandTargets = $cmdParsed.Targets }
     }
 
-    # If message has @prefix
-    if ($parsed.Target) {
-        $myName = $script:SessionName
-        if (-not $myName) { return @{ ShouldHandle = $false; Text = ""; IsCommand = $false } }
-
-        # Check if target matches my name (case-insensitive)
-        if ($parsed.Target -eq $myName.ToLower()) {
-            return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $false }
-        }
-        # Partial match (e.g., @fis matches "fiscal")
-        if ($myName.ToLower().StartsWith($parsed.Target)) {
-            return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $false }
-        }
-        return @{ ShouldHandle = $false; Text = ""; IsCommand = $false }
-    }
-
-    # No @prefix: only handle if I'm the only session, or if I'm the default (first registered)
+    # Regular message (not a command)
     $activeSessions = Get-ActiveSessions
     if ($activeSessions.Count -le 1) {
-        # I'm the only one — handle it
-        return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $false }
+        # Single session — handle directly
+        return @{ ShouldHandle = $true; Text = $RawText; IsCommand = $false; NeedsTarget = $false }
     }
 
-    # Multiple sessions active: only the "default" (lowest PID = oldest) handles unprefixed messages
-    $minPid = ($activeSessions | Sort-Object { [int]$_.Pid } | Select-Object -First 1).Pid
-    if ([int]$minPid -eq $PID) {
-        return @{ ShouldHandle = $true; Text = $parsed.Text; IsCommand = $false }
-    }
-
-    # Not for me
-    return @{ ShouldHandle = $false; Text = ""; IsCommand = $false }
+    # Multi-session: needs numbered list selection
+    # Any session that receives this message will handle it (no "default" — Telegram offset race)
+    return @{ ShouldHandle = $false; Text = $RawText; IsCommand = $false; NeedsTarget = $true }
 }
 
 # ============================================================================
@@ -1547,6 +1838,14 @@ function Invoke-ClaudePlus {
         $script:ClaudeWindowHandle = [IntPtr]::Zero
         $script:LastConsoleText = ""
         $script:PipeMessageCount = 0
+        $script:PendingFilePaths = @()
+        $script:PendingImagePaths = @()
+
+        # Clean up stale pending files from previous sessions
+        $stalePending = Join-Path $script:SessionRegistryDir "pending_message.json"
+        if (Test-Path $stalePending) { Remove-Item $stalePending -ErrorAction SilentlyContinue }
+        $stalePendingChoice = Join-Path $script:SessionRegistryDir "pending_choice.json"
+        if (Test-Path $stalePendingChoice) { Remove-Item $stalePendingChoice -ErrorAction SilentlyContinue }
 
         Delete-TelegramWebhook -Token $config.TelegramBotToken
 
@@ -1556,6 +1855,7 @@ function Invoke-ClaudePlus {
         $batPath = "$env:TEMP\claudeplus_$sessionId.bat"
         $batLines = @(
             "@echo off",
+            "title ClaudePlus @$Name",
             "cd /d `"$workDir`"",
             "cls",
             "`"$claudePath`" $allArgs",
@@ -1563,11 +1863,13 @@ function Invoke-ClaudePlus {
         )
         $batLines -join "`r`n" | Set-Content $batPath -Encoding ASCII
 
-        # Launch via Windows Terminal (wt.exe) if available, fallback to conhost.exe
+        # Launch terminal for Claude TUI — always use Windows Terminal if available
         $wtPath = (Get-Command wt.exe -ErrorAction SilentlyContinue).Source
+
         if ($wtPath) {
             Write-Host "[ClaudePlus] Lancement via Windows Terminal (wt.exe)..." -ForegroundColor Cyan
-            $script:ClaudeProcess = Start-Process -FilePath $wtPath -ArgumentList "--title `"ClaudePlus @$Name`" cmd.exe /c `"$batPath`"" -PassThru
+            # --window new : force une NOUVELLE fenetre WT (pas un onglet) pour isolation multi-session
+            $script:ClaudeProcess = Start-Process -FilePath $wtPath -ArgumentList "--window new --title `"ClaudePlus @$Name`" cmd.exe /c `"$batPath`"" -PassThru
             $script:UsesWindowsTerminal = $true
         } else {
             $conhost = "$env:SystemRoot\System32\conhost.exe"
@@ -1587,46 +1889,118 @@ function Invoke-ClaudePlus {
         $found = $false
 
         if ($script:UsesWindowsTerminal) {
-            # Windows Terminal: wt.exe spawns WindowsTerminal.exe which owns the window
-            # The window title contains our custom title "ClaudePlus @name"
-            for ($i = 0; $i -lt 30; $i++) {
-                Start-Sleep -Milliseconds 500
-                # Find WindowsTerminal process with our title
-                Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue | ForEach-Object {
-                    if ($_.MainWindowHandle -ne [IntPtr]::Zero -and -not $found) {
-                        if ($_.MainWindowTitle -match "ClaudePlus" -or $_.MainWindowTitle -match $Name) {
-                            $script:ClaudeWindowHandle = $_.MainWindowHandle
-                            $found = $true
-                            Write-Host "[ClaudePlus] FENETRE Windows Terminal TROUVEE! Handle=$($_.MainWindowHandle) Title='$($_.MainWindowTitle)'" -ForegroundColor Green
-                        }
-                    }
-                }
-                if ($found) { break }
+            # Windows Terminal: wt.exe -> WindowsTerminal.exe -> OpenConsole.exe -> cmd.exe -> claude
+            # STRATEGY: Find cmd.exe PID first (unique per session), then walk UP process tree
+            # to find the WindowsTerminal.exe parent. This is 100% reliable even in multi-session
+            # because each --window new creates a separate WT process.
+            # NOTE: Title-based search does NOT work — Claude Code TUI overwrites the window title.
 
-                # Also try: WT may reuse existing window, find cmd.exe child
+            # Step 1: Wait for cmd.exe to spawn and find its PID via our unique bat filename
+            Write-Host "[ClaudePlus] Recherche cmd.exe via bat file unique..." -ForegroundColor DarkGray
+            $batFileName = Split-Path -Leaf $batPath
+            for ($i = 0; $i -lt 20; $i++) {
+                Start-Sleep -Milliseconds 500
                 if ($script:ClaudeCmdPid -eq 0) {
-                    # WT process tree: wt.exe -> OpenConsole.exe -> cmd.exe -> claude
                     try {
-                        $wtChildren = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($script:ClaudeProcess.Id)" -ErrorAction SilentlyContinue
-                        foreach ($wc in $wtChildren) {
-                            $wcChildren = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($wc.ProcessId)" -ErrorAction SilentlyContinue
-                            foreach ($wcc in $wcChildren) {
-                                if ($wcc.Name -eq "cmd.exe") { $script:ClaudeCmdPid = [int]$wcc.ProcessId }
+                        # Search by command line containing our unique bat filename
+                        $cmdProcs = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -ErrorAction SilentlyContinue
+                        foreach ($cp in $cmdProcs) {
+                            if ($cp.CommandLine -and $cp.CommandLine -match [regex]::Escape($batFileName)) {
+                                $script:ClaudeCmdPid = [int]$cp.ProcessId
+                                Write-Host "[ClaudePlus] cmd.exe SESSION TROUVE! PID=$($script:ClaudeCmdPid) bat=$batFileName" -ForegroundColor Green
+                                break
                             }
-                            if ($wc.Name -eq "cmd.exe") { $script:ClaudeCmdPid = [int]$wc.ProcessId }
                         }
                     } catch { }
                 }
+                if ($script:ClaudeCmdPid -gt 0) { break }
             }
 
-            # If we didn't find by title, try any WT window that appeared after our launch
+            # Step 2: Walk UP the process tree from cmd.exe to find WindowsTerminal.exe
+            if ($script:ClaudeCmdPid -gt 0) {
+                Write-Host "[ClaudePlus] Remontee arbre process depuis cmd.exe PID=$($script:ClaudeCmdPid)..." -ForegroundColor DarkGray
+                $walkPid = $script:ClaudeCmdPid
+                for ($walk = 0; $walk -lt 10; $walk++) {
+                    try {
+                        $walkProc = Get-CimInstance Win32_Process -Filter "ProcessId=$walkPid" -ErrorAction SilentlyContinue
+                        if (-not $walkProc) { break }
+                        $parentPid = [int]$walkProc.ParentProcessId
+                        if ($parentPid -le 0) { break }
+                        $parentProc = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+                        if ($parentProc -and $parentProc.ProcessName -eq "WindowsTerminal") {
+                            if ($parentProc.MainWindowHandle -ne [IntPtr]::Zero) {
+                                $script:ClaudeWindowHandle = $parentProc.MainWindowHandle
+                                $found = $true
+                                Write-Host "[ClaudePlus] FENETRE WT TROUVEE (arbre process)! Handle=$($parentProc.MainWindowHandle) PID=$parentPid" -ForegroundColor Green
+                                break
+                            }
+                        }
+                        $walkPid = $parentPid
+                    } catch { break }
+                }
+            }
+
+            # Step 3: If tree walk failed, try finding WT by our wt.exe launch PID
+            if (-not $found -and $script:ClaudeProcess) {
+                Write-Host "[ClaudePlus] Arbre process: pas trouve, essai via PID lancement..." -ForegroundColor Yellow
+                for ($i = 0; $i -lt 10; $i++) {
+                    Start-Sleep -Milliseconds 500
+                    try {
+                        # wt.exe (our process) may have spawned WindowsTerminal.exe as child
+                        $wtChildren = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($script:ClaudeProcess.Id)" -ErrorAction SilentlyContinue
+                        foreach ($wc in $wtChildren) {
+                            $proc = Get-Process -Id $wc.ProcessId -ErrorAction SilentlyContinue
+                            if ($proc -and $proc.ProcessName -eq "WindowsTerminal" -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
+                                $script:ClaudeWindowHandle = $proc.MainWindowHandle
+                                $found = $true
+                                Write-Host "[ClaudePlus] FENETRE WT TROUVEE (enfant wt.exe)! Handle=$($proc.MainWindowHandle)" -ForegroundColor Green
+                                break
+                            }
+                        }
+                    } catch { }
+                    if ($found) { break }
+                }
+            }
+
+            # Step 4: Mono-session fallback — accept unique WT window
             if (-not $found) {
-                Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue | ForEach-Object {
-                    if ($_.MainWindowHandle -ne [IntPtr]::Zero -and -not $found) {
-                        $script:ClaudeWindowHandle = $_.MainWindowHandle
-                        $found = $true
-                        Write-Host "[ClaudePlus] FENETRE WT trouvee (fallback)! Handle=$($_.MainWindowHandle)" -ForegroundColor Yellow
+                $activeSessions = Get-ActiveSessions
+                $allWt = @(Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
+                if ($activeSessions.Count -le 1 -and $allWt.Count -eq 1) {
+                    $script:ClaudeWindowHandle = $allWt[0].MainWindowHandle
+                    $found = $true
+                    Write-Host "[ClaudePlus] FENETRE WT trouvee (unique, mono-session)! Handle=$($allWt[0].MainWindowHandle)" -ForegroundColor Yellow
+                }
+            }
+
+            # If cmd.exe PID still not found (Step 1 failed), try broader search
+            if ($script:ClaudeCmdPid -eq 0) {
+                Write-Host "[ClaudePlus] Recherche cmd.exe enfant (fallback)..." -ForegroundColor DarkGray
+                try {
+                    $allCmds = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -ErrorAction SilentlyContinue
+                    foreach ($cmd in $allCmds) {
+                        if ($cmd.CommandLine -and $cmd.CommandLine -match "claude") {
+                            $script:ClaudeCmdPid = [int]$cmd.ProcessId
+                            Write-Host "[ClaudePlus] cmd.exe claude TROUVE (fallback)! PID=$($script:ClaudeCmdPid)" -ForegroundColor Green
+                            break
+                        }
                     }
+                } catch { }
+            }
+
+            # Get console window handle for the cmd.exe (this is the conhost handle that accepts WM_CHAR)
+            if ($script:ClaudeCmdPid -gt 0) {
+                $cmdHwnd = Get-WindowHandleForPid -Pid1 $script:ClaudeCmdPid
+                if ($cmdHwnd -and $cmdHwnd -ne [IntPtr]::Zero) {
+                    Write-Host "[ClaudePlus] Console cmd.exe handle TROUVE: $cmdHwnd (pour PostMessage)" -ForegroundColor Green
+                    # CRITICAL: If WT window handle wasn't found, use the cmd.exe console handle instead
+                    # This is unique per session (each cmd.exe has its own console) — safe for multi-session
+                    if ($script:ClaudeWindowHandle -eq [IntPtr]::Zero) {
+                        $script:ClaudeWindowHandle = $cmdHwnd
+                        Write-Host "[ClaudePlus] Utilisation du handle console cmd.exe comme handle fenetre (fallback)" -ForegroundColor Yellow
+                    }
+                } else {
+                    Write-Host "[ClaudePlus] cmd.exe PID=$($script:ClaudeCmdPid) n'a pas de handle fenetre visible (WT l'heberge)" -ForegroundColor Yellow
                 }
             }
         } else {
@@ -1668,8 +2042,10 @@ function Invoke-ClaudePlus {
             }
         }
 
-        if (-not $found) {
+        if ($script:ClaudeWindowHandle -eq [IntPtr]::Zero) {
             Write-Host "[ClaudePlus] ATTENTION: Pas de handle fenetre. Le mirror TUI peut echouer (pipe mode OK)." -ForegroundColor Red
+        } else {
+            Write-Host "[ClaudePlus] Handle fenetre final: $($script:ClaudeWindowHandle) (SendKeys actif)" -ForegroundColor Green
         }
 
         # Initialize voice transcription (Python + faster-whisper + ffmpeg)
@@ -1677,25 +2053,28 @@ function Invoke-ClaudePlus {
 
         # Build startup message with session info
         $startupLines = @()
-        $startupLines += "$([char]0x25BA) @$Name demarre!"
+        $startupLines += "@${Name} : $([char]0x25BA) Session demarree!"
         $startupLines += "Dossier: $(Split-Path -Leaf $workDir)"
         if ($sessionCount -gt 1) {
             $otherNames = ($activeSessions | Where-Object { $_.Pid -ne $PID } | ForEach-Object { "@$($_.Name)" }) -join ", "
             $startupLines += "Autres sessions: $otherNames"
             $startupLines += ""
-            $startupLines += "Prefixez avec @$Name pour cibler cette session"
+            $startupLines += "Repondez avec @${Name} : votre message"
         }
         if ($voiceOk) {
             $startupLines += "Texte et vocal OK"
         } else {
             $startupLines += "Texte OK (vocal desactive)"
         }
-        $startupLines += "/stop pour arreter | /list pour voir les sessions"
-        Send-TelegramMessage -Message ($startupLines -join "`n") -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+        $modeLabel = if ($script:TelegramVerbose) { "detaille" } else { "discret" }
+        $startupLines += "Mode: $modeLabel (/verbose ou /quiet)"
+        $startupLines += "/help | /list | /verbose | /quiet | /stop"
 
-        # Wait for Claude TUI to start in the visible terminal
+        # Wait for Claude TUI to start in the visible terminal BEFORE sending Telegram notification
         Write-Host "[ClaudePlus] Attente demarrage Claude TUI (3s)..." -ForegroundColor DarkGray
         Start-Sleep -Seconds 3
+
+        Send-TelegramMessage -Message ($startupLines -join "`n") -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
 
         # Telegram polling loop -- uses pipe mode (claude -p) for clean responses
         Write-Host "[ClaudePlus] Mode PIPE actif: les messages Telegram passent par 'claude -p' (pas par le terminal)" -ForegroundColor Cyan
@@ -1724,24 +2103,15 @@ function Invoke-ClaudePlus {
                 # With Windows Terminal, wt.exe exits immediately (delegates to existing WT instance)
                 # So we check the cmd.exe child or the WT window instead
                 if ($script:UsesWindowsTerminal) {
-                    # For WT: check if the window still exists or if cmd.exe child is alive
+                    # For WT: check if cmd.exe child (running Claude) is still alive
+                    # Don't check "any WT" — user may have other WT tabs open
                     $wtAlive = $false
-                    if ($script:ClaudeWindowHandle -ne [IntPtr]::Zero) {
-                        # Check if window handle is still valid
-                        $wtProc = Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -eq $script:ClaudeWindowHandle }
-                        if ($wtProc) { $wtAlive = $true }
-                    }
-                    if (-not $wtAlive -and $script:ClaudeCmdPid -gt 0) {
+                    if ($script:ClaudeCmdPid -gt 0) {
                         $cmdProc = Get-Process -Id $script:ClaudeCmdPid -ErrorAction SilentlyContinue
                         if ($cmdProc) { $wtAlive = $true }
                     }
                     if (-not $wtAlive) {
-                        # WT window might still exist with a different handle, check any WT
-                        $anyWt = Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue
-                        if ($anyWt) { $wtAlive = $true }
-                    }
-                    if (-not $wtAlive) {
-                        Write-Host "[ClaudePlus] Windows Terminal ferme, arret." -ForegroundColor Yellow
+                        Write-Host "[ClaudePlus] Terminal Claude ferme (cmd.exe PID=$($script:ClaudeCmdPid) termine), arret." -ForegroundColor Yellow
                         break
                     }
                 } else {
@@ -1753,14 +2123,167 @@ function Invoke-ClaudePlus {
                     }
                 }
 
+                # --- CHECK DISPATCH FILES (inter-session routing) ---
+                $dispatchFile = Join-Path $script:SessionRegistryDir "dispatch_$($Name.ToLower()).json"
+                if (Test-Path $dispatchFile) {
+                    try {
+                        # CRITICAL: Reset ALL file state before dispatch processing
+                        $script:PendingFilePaths = @()
+                        $script:PendingImagePaths = @()
+
+                        $dispatchData = Get-Content $dispatchFile -Raw | ConvertFrom-Json
+                        Remove-Item $dispatchFile -ErrorAction SilentlyContinue
+                        Write-Host "[ClaudePlus] Dispatch recu: '$($dispatchData.Text)'" -ForegroundColor Green
+
+                        # Extract ONLY the text — NO file handling from dispatch
+                        # PS 5 ConvertFrom-Json turns [] into $null or phantom objects
+                        # Solution: extract file paths with EXPLICIT string validation
+                        $dispatchText = if ($dispatchData.Text) { [string]$dispatchData.Text } else { "" }
+                        $safeImagePaths = [System.Collections.Generic.List[string]]::new()
+                        $safeFilePaths = [System.Collections.Generic.List[string]]::new()
+
+                        # Bulletproof extraction: iterate and validate each path is a real non-empty string
+                        if ($dispatchData.ImagePaths -ne $null) {
+                            foreach ($p in $dispatchData.ImagePaths) {
+                                $ps = [string]$p
+                                if ($ps -and $ps.Length -gt 2 -and (Test-Path $ps -ErrorAction SilentlyContinue)) {
+                                    $safeImagePaths.Add($ps)
+                                }
+                            }
+                        }
+                        if ($dispatchData.FilePaths -ne $null) {
+                            foreach ($p in $dispatchData.FilePaths) {
+                                $ps = [string]$p
+                                if ($ps -and $ps.Length -gt 2 -and (Test-Path $ps -ErrorAction SilentlyContinue)) {
+                                    $safeFilePaths.Add($ps)
+                                }
+                            }
+                        }
+
+                        # Only append "Fichier joint:" if the file ACTUALLY EXISTS on disk
+                        if ($safeFilePaths.Count -gt 0) {
+                            $script:PendingFilePaths = @($safeFilePaths)
+                            foreach ($f in $safeFilePaths) {
+                                $dispatchText += "`nFichier joint: $f"
+                            }
+                        }
+                        if ($safeImagePaths.Count -gt 0) {
+                            $script:PendingImagePaths = @($safeImagePaths)
+                        }
+
+                        Write-Host "[ClaudePlus] [DEBUG-DISPATCH] dispatchText='$dispatchText' safeImages=$($safeImagePaths.Count) safeFiles=$($safeFilePaths.Count)" -ForegroundColor Magenta
+
+                        if (-not $waitingForResponse -and $dispatchText) {
+                            Write-Host "`n  >> [$Name] (dispatch) $dispatchText" -ForegroundColor Cyan
+                            $waitingForResponse = $true
+
+                            # Send text to TUI terminal for visual display
+                            if ($script:ClaudeWindowHandle -ne [IntPtr]::Zero) {
+                                $tText = $dispatchText
+                                if ($tText.Length -gt 200) { $tText = $tText.Substring(0, 197) + "..." }
+                                $tText = ($tText -split "`n" | Where-Object { $_ -notmatch '\\claudeplus_|Fichier joint:|\[Image' }) -join " "
+                                if ($tText.Length -gt 0) { Send-TextToClaude -Text $tText | Out-Null }
+                            }
+
+                            $useSkip = ($config.DangerouslySkipPermissions -eq $true)
+                            # FORCE fresh session for dispatch — never use --continue
+                            $useContinue = $false
+                            $script:PipeMessageCount = 0
+                            $responseText = $null
+                            $imgArgs = @()
+                            if ($safeImagePaths.Count -gt 0) {
+                                $imgArgs = @($safeImagePaths)
+                            }
+
+                            Write-Host "[ClaudePlus] Tentative 1/3: stream-json..." -ForegroundColor DarkGray
+                            $responseText = Invoke-ClaudePipe -Message $dispatchText -ClaudePath $claudePath -WorkDir $workDir -Continue:$false -DangerouslySkipPermissions:$useSkip -TelegramToken $config.TelegramBotToken -TelegramChatId $config.TelegramChatId -SessionName $Name -ImagePaths $imgArgs
+
+                            if (-not $responseText -or $responseText.Length -le 3) {
+                                Write-Host "[ClaudePlus] Tentative 2/3: pipe plain..." -ForegroundColor Yellow
+                                Start-Sleep -Seconds 2
+                                $responseText = Invoke-ClaudePipePlain -Message $dispatchText -ClaudePath $claudePath -WorkDir $workDir -DangerouslySkipPermissions:$useSkip
+                            }
+                            if (-not $responseText -or $responseText.Length -le 3) {
+                                Write-Host "[ClaudePlus] Tentative 3/3: pipe plain (session fraiche)..." -ForegroundColor Yellow
+                                Start-Sleep -Seconds 3
+                                $responseText = Invoke-ClaudePipePlain -Message $dispatchText -ClaudePath $claudePath -WorkDir $workDir -DangerouslySkipPermissions:$useSkip
+                                if ($responseText -and $responseText.Length -gt 3) { $script:PipeMessageCount = 0 }
+                            }
+
+                            $script:PipeMessageCount++
+                            $waitingForResponse = $false
+
+                            if ($responseText -and $responseText.Length -gt 3) {
+                                $previewLen = [Math]::Min(200, $responseText.Length)
+                                Write-Host "  << $($responseText.Substring(0, $previewLen))$(if($responseText.Length -gt 200){'...'})" -ForegroundColor Green
+                                $toolSection = ""
+                                if ($script:TelegramVerbose -and $script:LastPipeTools -and $script:LastPipeToolCount -gt 0) {
+                                    $toolSection = "$([char]0x2699) Outils ($($script:LastPipeToolCount)):`n"
+                                    foreach ($t in $script:LastPipeTools) { $toolSection += "$t`n" }
+                                    $toolSection += "`n"
+                                }
+                                $maxTextLen = 3900 - $toolSection.Length
+                                if ($maxTextLen -lt 500) { $maxTextLen = 500; $toolSection = "" }
+                                if ($responseText.Length -gt $maxTextLen) { $responseText = $responseText.Substring(0, $maxTextLen) + "`n[... tronque]" }
+                                Send-TelegramMessage -Message "@${Name} : ${toolSection}${responseText}" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                            } else {
+                                Send-TelegramMessage -Message "@${Name} : Echec apres 3 tentatives." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                            }
+
+                            # Cleanup ONLY real files
+                            foreach ($tmpFile in @($safeImagePaths) + @($safeFilePaths)) {
+                                if ($tmpFile -and $tmpFile.Length -gt 2 -and (Test-Path $tmpFile)) { Remove-Item $tmpFile -ErrorAction SilentlyContinue }
+                            }
+                            Get-ChildItem -Path $workDir -Filter "telegram_claudeplus_*" -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue
+                            $script:PendingFilePaths = @()
+                            $script:PendingImagePaths = @()
+                        }
+                    } catch {
+                        Write-Host "[ClaudePlus] Erreur dispatch: $_" -ForegroundColor Red
+                    }
+                }
+
+                # --- CHECK PENDING CHOICE TIMEOUT (shared file) ---
+                $pendingMsgFile = Join-Path $script:SessionRegistryDir "pending_message.json"
+                if (Test-Path $pendingMsgFile) {
+                    try {
+                        $pendingCheck = Get-Content $pendingMsgFile -Raw | ConvertFrom-Json
+                        $elapsed = (Get-Date) - [datetime]$pendingCheck.Timestamp
+                        if ($elapsed.TotalSeconds -gt 60) {
+                            Remove-Item $pendingMsgFile -ErrorAction SilentlyContinue
+                            $pendingChoiceCleanup = Join-Path $script:SessionRegistryDir "pending_choice.json"
+                            Remove-Item $pendingChoiceCleanup -ErrorAction SilentlyContinue
+                            $script:WaitingForSessionChoice = $false
+                            $script:SessionChoiceMap = @{}
+                            # Only one session sends the cancellation message (the one that stored it)
+                            if ($pendingCheck.SenderPid -eq $PID) {
+                                Send-TelegramMessage -Message "$([char]0x2716) Demande annulee (delai de 60s depasse)." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                            }
+                            Write-Host "[ClaudePlus] Timeout choix session — demande annulee." -ForegroundColor Yellow
+                        }
+                    } catch {
+                        # Corrupted file, clean up
+                        Remove-Item $pendingMsgFile -ErrorAction SilentlyContinue
+                    }
+                }
+
                 # --- CHECK TELEGRAM ---
                 try {
-                    $url = "https://api.telegram.org/bot$($config.TelegramBotToken)/getUpdates?limit=10&timeout=2"
+                    # Use short polling (timeout=0) to avoid 409 conflict when multiple sessions share the same bot
+                    $activeSessions = Get-ActiveSessions
+                    $multiSession = ($activeSessions.Count -gt 1)
+                    $pollTimeout = if ($multiSession) { 0 } else { 2 }
+                    $url = "https://api.telegram.org/bot$($config.TelegramBotToken)/getUpdates?limit=10&timeout=$pollTimeout"
                     if ($lastUpdateId -gt 0) { $url += "&offset=$($lastUpdateId + 1)" }
-                    if ($pollCount % 10 -eq 1) {
-                        Write-Host "[ClaudePlus] Telegram poll #$pollCount (offset=$lastUpdateId, hwnd=$($script:ClaudeWindowHandle))" -ForegroundColor DarkGray
+                    if ($pollCount -le 5 -or $pollCount % 10 -eq 1) {
+                        Write-Host "[ClaudePlus] Telegram poll #$pollCount (offset=$lastUpdateId, hwnd=$($script:ClaudeWindowHandle)$(if($multiSession){', multi'}))" -ForegroundColor DarkGray
                     }
                     $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 5 -ErrorAction Stop
+
+                    if ($pollCount -le 5) {
+                        $msgCount = if ($response.result) { $response.result.Count } else { 0 }
+                        Write-Host "[ClaudePlus] Poll #${pollCount} ok=$($response.ok) messages=$msgCount" -ForegroundColor DarkGray
+                    }
 
                     if ($response.ok -and $response.result) {
                         foreach ($update in $response.result) {
@@ -1772,80 +2295,510 @@ function Invoke-ClaudePlus {
                             # Determine message type: text or voice
                             $text = $null
                             $isVoice = $false
+                            # CRITICAL: Reset file/image paths at each iteration to prevent leakage from previous messages
+                            $script:PendingFilePaths = @()
+                            $script:PendingImagePaths = @()
 
                             if ($msg.voice -or $msg.audio) {
                                 # Voice message or audio file
+                                # In multi-session, use caption for routing: send vocal with caption "@fiscaliq"
+                                # Caption is checked BEFORE transcription to avoid transcribing for wrong session
                                 $isVoice = $true
+                                $voiceCaption = if (-not [string]::IsNullOrEmpty($msg.caption)) { $msg.caption.Trim() } else { $null }
+
+                                # Multi-session: only default session handles voice
+                                $activeSessions = Get-ActiveSessions
+                                if ($activeSessions.Count -gt 1) {
+                                    $minPid = ($activeSessions | Sort-Object { [int]$_.Pid } | Select-Object -First 1).Pid
+                                    if ([int]$minPid -ne $PID) {
+                                        Write-Host "[ClaudePlus] Vocal en multi-session — pas le default, skip." -ForegroundColor DarkGray
+                                        continue
+                                    }
+                                }
+
                                 $fileId = if ($msg.voice) { $msg.voice.file_id } else { $msg.audio.file_id }
                                 $duration = if ($msg.voice) { $msg.voice.duration } else { $msg.audio.duration }
 
                                 if (-not $script:TranscriptionReady) {
-                                    Send-TelegramMessage -Message "[Vocal non supporte - Python/faster-whisper manquant]" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                    Send-TelegramMessage -Message "@${Name} : Vocal non supporte (Python/faster-whisper manquant)" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                                     continue
                                 }
 
                                 Write-Host ""
                                 Write-Host "  >> [Vocal ${duration}s] Transcription..." -ForegroundColor DarkCyan
-                                Send-TelegramMessage -Message "[Transcription en cours...]" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                Send-TelegramMessage -Message "@${Name} : Transcription en cours..." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
 
                                 $transcription = Transcribe-TelegramAudio -FileId $fileId -Token $config.TelegramBotToken
                                 if (-not $transcription -or [string]::IsNullOrEmpty($transcription.text)) {
-                                    Send-TelegramMessage -Message "[Erreur transcription - audio non reconnu]" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                    Send-TelegramMessage -Message "@${Name} : Erreur transcription (audio non reconnu)" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                                     continue
                                 }
 
-                                $text = $transcription.text.Trim()
+                                # Build final text: transcription + optional extra instruction from caption
+                                $transcribedText = $transcription.text.Trim()
                                 $lang = $transcription.language
                                 $conf = [int]($transcription.probability * 100)
-                                Write-Host "  >> [Vocal -> $lang ${conf}%] $text" -ForegroundColor Cyan
-                                Send-TelegramMessage -Message "[Transcription ($lang ${conf}%)]: $text" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                Write-Host "  >> [Vocal -> $lang ${conf}%] $transcribedText" -ForegroundColor Cyan
+                                Send-TelegramMessage -Message "@${Name} : Transcription ($lang ${conf}%): $transcribedText" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+
+                                # If caption had extra text after @name (e.g. "@fiscal : en anglais"), prepend it
+                                if ($voiceCaption) {
+                                    $captionParsed = Parse-MessageTarget -Message $voiceCaption
+                                    $extraInstruction = $captionParsed.Text
+                                    if ($extraInstruction -and $extraInstruction.Length -gt 0) {
+                                        $text = "$extraInstruction : $transcribedText"
+                                    } else {
+                                        $text = $transcribedText
+                                    }
+                                } else {
+                                    $text = $transcribedText
+                                }
+
+                                # Multi-session: store transcription as pending in shared file, ask user to choose session
+                                if ($activeSessions.Count -gt 1) {
+                                    $voicePendingFile = Join-Path $script:SessionRegistryDir "pending_message.json"
+                                    $safeVT = ConvertTo-SafeJsonString -Value $text
+                                    $ts = (Get-Date).ToString("o")
+                                    $voiceJson = '{"Text":"' + $safeVT + '","Type":"text","ImagePaths":[],"FilePaths":[],"Timestamp":"' + $ts + '","SenderPid":' + $PID + '}'
+                                    Set-Content -Path $voicePendingFile -Value $voiceJson -Encoding UTF8 -ErrorAction SilentlyContinue
+                                    $script:WaitingForSessionChoice = $true
+                                    Send-SessionChoiceList -Token $config.TelegramBotToken -ChatId $config.TelegramChatId -MessagePreview $text
+                                    continue
+                                }
+
+                            } elseif ($msg.photo -or $msg.document) {
+                                # Photo or document/file from Telegram
+                                # Multi-session: only default session handles files
+                                $activeSessions = Get-ActiveSessions
+                                if ($activeSessions.Count -gt 1) {
+                                    $minPid = ($activeSessions | Sort-Object { [int]$_.Pid } | Select-Object -First 1).Pid
+                                    if ([int]$minPid -ne $PID) {
+                                        Write-Host "[ClaudePlus] Fichier en multi-session — pas le default, skip." -ForegroundColor DarkGray
+                                        continue
+                                    }
+                                }
+
+                                $attachedFiles = @()
+                                $isImage = $false
+
+                                if ($msg.photo) {
+                                    # Photo: array of sizes, take the largest (last)
+                                    $photoSizes = @($msg.photo)
+                                    $bestPhoto = $photoSizes[-1]
+                                    $fileId = $bestPhoto.file_id
+                                    $isImage = $true
+                                    Write-Host "[ClaudePlus] Photo recue ($($bestPhoto.width)x$($bestPhoto.height))" -ForegroundColor DarkCyan
+                                    $localPath = Download-TelegramFile -FileId $fileId -Token $config.TelegramBotToken -OutputPath "$env:TEMP\claudeplus_photo_$(Get-Random).jpg"
+                                    if ($localPath) { $attachedFiles += $localPath }
+                                }
+                                elseif ($msg.document) {
+                                    $fileId = $msg.document.file_id
+                                    $fileName = $msg.document.file_name
+                                    $mimeType = $msg.document.mime_type
+                                    $fileSize = $msg.document.file_size
+                                    Write-Host "[ClaudePlus] Document recu: $fileName ($mimeType, $([Math]::Round($fileSize/1024,1)) KB)" -ForegroundColor DarkCyan
+
+                                    # Check file size limit (Telegram API: 20MB max download)
+                                    if ($fileSize -gt 20 * 1024 * 1024) {
+                                        Send-TelegramMessage -Message "@${Name} : Fichier trop volumineux (max 20MB)" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                        continue
+                                    }
+
+                                    $ext = [System.IO.Path]::GetExtension($fileName)
+                                    $localPath = Download-TelegramFile -FileId $fileId -Token $config.TelegramBotToken -OutputPath "$env:TEMP\claudeplus_doc_$(Get-Random)$ext"
+                                    if ($localPath) {
+                                        $attachedFiles += $localPath
+                                        # Check if this is an image
+                                        if ($mimeType -match "^image/") { $isImage = $true }
+                                    }
+                                }
+
+                                if ($attachedFiles.Count -eq 0) {
+                                    Send-TelegramMessage -Message "@${Name} : Erreur telechargement du fichier" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                    continue
+                                }
+
+                                # Caption = text accompanying the file, or default prompt
+                                $text = if (-not [string]::IsNullOrEmpty($msg.caption)) { $msg.caption.Trim() } else { "Analyse ce fichier" }
+
+                                # Determine which files are images (for --image flag) vs other files (mention in prompt)
+                                $imageExts = @(".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".tiff", ".tif")
+                                $script:PendingImagePaths = @()
+                                $script:PendingFilePaths = @()
+                                foreach ($f in $attachedFiles) {
+                                    $fExt = [System.IO.Path]::GetExtension($f).ToLower()
+                                    if ($isImage -or $fExt -in $imageExts) {
+                                        $script:PendingImagePaths += $f
+                                    } else {
+                                        $script:PendingFilePaths += $f
+                                        # For non-image files, add path to the prompt so Claude can read them
+                                        $text += "`nFichier joint: $f"
+                                    }
+                                }
+
+                                $fileNames = ($attachedFiles | ForEach-Object { Split-Path -Leaf $_ }) -join ", "
+                                Write-Host "  >> [$Name] $text [fichier: $fileNames]" -ForegroundColor Cyan
+
+                                # Multi-session: store file info as pending in shared file, ask user to choose session
+                                if ($activeSessions.Count -gt 1) {
+                                    $filePendingFile = Join-Path $script:SessionRegistryDir "pending_message.json"
+                                    $safeFT = ConvertTo-SafeJsonString -Value $text
+                                    $imgArr = ConvertTo-SafeJsonPathArray -Paths $script:PendingImagePaths
+                                    $fileArr = ConvertTo-SafeJsonPathArray -Paths $script:PendingFilePaths
+                                    $ts = (Get-Date).ToString("o")
+                                    $fileJson = '{"Text":"' + $safeFT + '","Type":"file","ImagePaths":' + $imgArr + ',"FilePaths":' + $fileArr + ',"Timestamp":"' + $ts + '","SenderPid":' + $PID + '}'
+                                    Set-Content -Path $filePendingFile -Value $fileJson -Encoding UTF8 -ErrorAction SilentlyContinue
+                                    $script:WaitingForSessionChoice = $true
+                                    Send-SessionChoiceList -Token $config.TelegramBotToken -ChatId $config.TelegramChatId -MessagePreview $text
+                                    continue
+                                }
 
                             } elseif (-not [string]::IsNullOrEmpty($msg.text)) {
                                 $text = $msg.text.Trim()
                             } else {
+                                # Unknown message type, log and skip
+                                Write-Host "[ClaudePlus] Message ignore (type non supporte)" -ForegroundColor DarkGray
                                 continue
                             }
 
                             if (-not $text -or $text.Length -eq 0) { continue }
 
-                            # --- MULTI-SESSION ROUTING ---
+                            Write-Host "[ClaudePlus] Message recu: '$text' (chat=$($msg.chat.id))" -ForegroundColor Cyan
+
+                            # --- SESSION CHOICE INTERCEPTION ---
+                            # Check if a pending message exists (shared file) and user sent a number
+                            # ANY session can handle this — no "default" concept (Telegram offset race)
+                            $choiceResolved = $false
+                            $pendingMsgFile = Join-Path $script:SessionRegistryDir "pending_message.json"
+                            $pendingChoiceFile = Join-Path $script:SessionRegistryDir "pending_choice.json"
+                            if ($text -match '^\s*[\d,\s]+\s*$' -and (Test-Path $pendingMsgFile)) {
+                                try {
+                                    # ATOMIC CLAIM: rename file to claim ownership
+                                    # First session to rename wins, others find file gone
+                                    $claimedFile = Join-Path $script:SessionRegistryDir "pending_message_claimed_$PID.json"
+                                    try {
+                                        [System.IO.File]::Move(
+                                            (Join-Path $script:SessionRegistryDir "pending_message.json"),
+                                            $claimedFile
+                                        )
+                                    } catch {
+                                        # Another session already claimed it — skip
+                                        Write-Host "[ClaudePlus] Pending deja reclame par une autre session, skip." -ForegroundColor DarkGray
+                                        continue
+                                    }
+                                    # Also claim choice file
+                                    $claimedChoiceFile = Join-Path $script:SessionRegistryDir "pending_choice_claimed_$PID.json"
+                                    if (Test-Path $pendingChoiceFile) {
+                                        try { [System.IO.File]::Move($pendingChoiceFile, $claimedChoiceFile) } catch {}
+                                    }
+
+                                    # Load the claimed pending message and choice map
+                                    $pending = Get-Content $claimedFile -Raw | ConvertFrom-Json
+                                    $choiceData = $null
+                                    if (Test-Path $claimedChoiceFile) {
+                                        $choiceData = Get-Content $claimedChoiceFile -Raw | ConvertFrom-Json
+                                    }
+                                    # Clean up claimed files immediately
+                                    Remove-Item $claimedFile -ErrorAction SilentlyContinue
+                                    Remove-Item $claimedChoiceFile -ErrorAction SilentlyContinue
+
+                                    # Rebuild SessionChoiceMap from shared file
+                                    if ($choiceData -and $choiceData.SessionChoiceMap) {
+                                        $script:SessionChoiceMap = @{}
+                                        $choiceData.SessionChoiceMap.PSObject.Properties | ForEach-Object {
+                                            $script:SessionChoiceMap[[int]$_.Name] = $_.Value
+                                        }
+                                    }
+
+                                    $chosenNames = Resolve-SessionChoice -UserInput $text
+                                    if ($chosenNames) {
+                                        $script:WaitingForSessionChoice = $false
+                                        $script:SessionChoiceMap = @{}
+
+                                        $myNameLower = $Name.ToLower()
+                                        $targetLabel = "@" + ($chosenNames -join ", @")
+                                        Send-TelegramMessage -Message "$([char]0x2192) Message envoye a $targetLabel" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+
+                                        # Bulletproof extraction of file paths from pending JSON
+                                        # PS 5 ConvertFrom-Json turns [] into phantom objects — validate each path
+                                        $pendingSafeImages = [System.Collections.Generic.List[string]]::new()
+                                        $pendingSafeFiles = [System.Collections.Generic.List[string]]::new()
+                                        if ($pending.ImagePaths -ne $null) {
+                                            foreach ($p in $pending.ImagePaths) {
+                                                $ps = [string]$p
+                                                if ($ps -and $ps.Length -gt 2 -and (Test-Path $ps -ErrorAction SilentlyContinue)) {
+                                                    $pendingSafeImages.Add($ps)
+                                                }
+                                            }
+                                        }
+                                        if ($pending.FilePaths -ne $null) {
+                                            foreach ($p in $pending.FilePaths) {
+                                                $ps = [string]$p
+                                                if ($ps -and $ps.Length -gt 2 -and (Test-Path $ps -ErrorAction SilentlyContinue)) {
+                                                    $pendingSafeFiles.Add($ps)
+                                                }
+                                            }
+                                        }
+
+                                        # Dispatch to target sessions via files
+                                        $iAmTarget = $false
+                                        foreach ($targetName in $chosenNames) {
+                                            if ($targetName -eq $myNameLower) {
+                                                $iAmTarget = $true
+                                            } else {
+                                                Write-DispatchFile -TargetSessionName $targetName -Text $pending.Text -ImagePaths @($pendingSafeImages) -FilePaths @($pendingSafeFiles)
+                                                Write-Host "[ClaudePlus] Dispatch ecrit pour @$targetName" -ForegroundColor DarkCyan
+                                            }
+                                        }
+
+                                        if ($iAmTarget) {
+                                            # I'm one of the targets — process the pending message directly
+                                            $text = $pending.Text
+                                            # Use pre-validated safe arrays — NEVER trust raw ConvertFrom-Json
+                                            $script:PendingImagePaths = @($pendingSafeImages)
+                                            $script:PendingFilePaths = @($pendingSafeFiles)
+                                            $choiceResolved = $true
+                                            # CRITICAL: Delete any dispatch file for myself that another session may have written
+                                            # (prevents double-processing: once via iAmTarget, once via dispatch)
+                                            $myDispatchFile = Join-Path $script:SessionRegistryDir "dispatch_$myNameLower.json"
+                                            if (Test-Path $myDispatchFile) {
+                                                Remove-Item $myDispatchFile -ErrorAction SilentlyContinue
+                                                Write-Host "[ClaudePlus] Dispatch file pour moi supprime (evite double traitement)" -ForegroundColor DarkYellow
+                                            }
+                                            Write-Host "[ClaudePlus] Je suis la cible — text='$text', images=$($pendingSafeImages.Count), files=$($pendingSafeFiles.Count)" -ForegroundColor Green
+                                            # Fall through to send-to-Claude below (skip routing)
+                                        } else {
+                                            # Not my target, dispatched to others only
+                                            continue
+                                        }
+                                    } else {
+                                        # Invalid number — show error
+                                        $maxNum = 0
+                                        if ($script:SessionChoiceMap.Count -gt 0) {
+                                            $maxNum = ($script:SessionChoiceMap.Keys | Measure-Object -Maximum).Maximum
+                                        }
+                                        Send-TelegramMessage -Message "$([char]0x2757) Numero invalide. Tapez un numero entre 0 et $maxNum (ou plusieurs: 1,2,3)." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                        continue
+                                    }
+                                } catch {
+                                    Write-Host "[ClaudePlus] Erreur lecture pending: $_" -ForegroundColor Red
+                                    # Clean up all possible files (original + claimed)
+                                    Remove-Item $pendingMsgFile -ErrorAction SilentlyContinue
+                                    Remove-Item $pendingChoiceFile -ErrorAction SilentlyContinue
+                                    $clF = Join-Path $script:SessionRegistryDir "pending_message_claimed_$PID.json"
+                                    $clC = Join-Path $script:SessionRegistryDir "pending_choice_claimed_$PID.json"
+                                    Remove-Item $clF -ErrorAction SilentlyContinue
+                                    Remove-Item $clC -ErrorAction SilentlyContinue
+                                    $script:WaitingForSessionChoice = $false
+                                }
+                            }
+
+                            # --- MULTI-SESSION ROUTING (skip if choice was just resolved) ---
+                            if ($choiceResolved) {
+                                Write-Host "[ClaudePlus] Choix resolu, skip routing direct vers Claude." -ForegroundColor Green
+                                # FORCE fresh pipe session — never use --continue for resolved choices
+                                # This prevents stale context (e.g. previous "fichier joint" being remembered by Claude)
+                                $script:PipeMessageCount = 0
+                            } else {
                             $routing = Test-MessageForMe -RawText $text
+                            Write-Host "[ClaudePlus] Routing: ShouldHandle=$($routing.ShouldHandle), IsCmd=$($routing.IsCommand), NeedsTarget=$($routing.NeedsTarget)" -ForegroundColor DarkGray
+
+                            # If command but not targeted at me, skip silently
+                            if ($routing.IsCommand -and -not $routing.ShouldHandle) {
+                                Write-Host "[ClaudePlus] Commande non ciblee pour moi, skip." -ForegroundColor DarkGray
+                                continue
+                            }
 
                             # Handle /list command (show active sessions)
                             if ($routing.IsCommand -and $routing.Text -match '^/list|^/sessions') {
                                 $sessions = Get-ActiveSessions
                                 if ($sessions.Count -eq 0) {
-                                    $listMsg = "Aucune session active"
+                                    $listMsg = "@${Name} : Aucune session active"
                                 } else {
-                                    $listMsg = "$([char]0x25A0) Sessions actives ($($sessions.Count)):`n"
+                                    $listMsg = "@${Name} : $([char]0x25A0) Sessions actives ($($sessions.Count)):`n"
                                     foreach ($s in $sessions) {
                                         $me = if ($s.Pid -eq $PID) { " $([char]0x2190) ici" } else { "" }
                                         $listMsg += "  @$($s.Name) — $(Split-Path -Leaf $s.WorkDir)$me`n"
                                     }
-                                    $listMsg += "`nPrefixez: @nom message"
                                 }
                                 Send-TelegramMessage -Message $listMsg.TrimEnd() -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                                 continue
                             }
 
                             if ($routing.IsCommand -and $routing.Text -match '^/stop') {
-                                Send-TelegramMessage -Message "@$Name arrete." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                $cmdInfo = Parse-CommandTargets -CommandText $routing.Text
+                                $targetLabel = if ($cmdInfo.Targets.Count -gt 0) { " (cibles: $($cmdInfo.Targets -join ', '))" } else { "" }
+                                Send-TelegramMessage -Message "@${Name} : Session arretee.$targetLabel" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                                 $stopRequested = $true
                                 break
                             }
 
-                            if (-not $routing.ShouldHandle) {
-                                # Message is for another session, skip silently
+                            # Help command — detailed, well-formatted help
+                            if ($routing.IsCommand -and $routing.Text -match '^/help|^/aide') {
+                                $activeSessions = Get-ActiveSessions
+                                $isMulti = ($activeSessions.Count -gt 1)
+                                $sep = "$([char]0x2500)" * 30
+                                $bullet = "$([char]0x2022)"
+                                $arrow = "$([char]0x2192)"
+                                $gear = "$([char]0x2699)"
+                                $info = "$([char]0x2139)"
+                                $excl = "$([char]0x2757)"
+                                $quest = "$([char]0x2753)"
+                                $modeIcon = if ($script:TelegramVerbose) { "$([char]0x266A)" } else { "$([char]0x266B)" }
+                                $modeNow = if ($script:TelegramVerbose) { "$modeIcon Detaille" } else { "$modeIcon Discret" }
+
+                                $h = ""
+                                $h += "$gear ClaudePlus $([char]0x2014) Guide complet`n$sep"
+
+                                # --- SECTION: Envoyer des messages ---
+                                $h += "`n`n$([char]0x270F) ENVOYER DES MESSAGES`n$sep"
+                                if ($isMulti) {
+                                    $h += "`n"
+                                    $h += "`n$bullet Ecrivez votre message directement."
+                                    $h += "`n$bullet Le bot affiche la liste des sessions."
+                                    $h += "`n$bullet Tapez le numero pour choisir :"
+                                    $h += "`n   1 $arrow une session"
+                                    $h += "`n   1,2,3 $arrow plusieurs sessions"
+                                    $h += "`n   0 $arrow toutes les sessions"
+                                } else {
+                                    $h += "`n"
+                                    $h += "`n$bullet Ecrivez votre message directement,"
+                                    $h += "`n   Claude le recoit et repond."
+                                }
+
+                                # --- SECTION: Vocaux ---
+                                $h += "`n`n$([char]0x266A) MESSAGES VOCAUX`n$sep"
+                                $h += "`n"
+                                $h += "`n$bullet Envoyez un message vocal."
+                                $h += "`n$bullet Il sera transcrit automatiquement"
+                                $h += "`n   puis envoye a Claude."
+                                if ($isMulti) {
+                                    $h += "`n"
+                                    $h += "`n$bullet Apres transcription, le bot vous"
+                                    $h += "`n   demande de choisir la session."
+                                }
+
+                                # --- SECTION: Images and Fichiers ---
+                                $h += "`n`n$([char]0x25A0) IMAGES ET FICHIERS`n$sep"
+                                $h += "`n"
+                                $h += "`n$bullet Images : jpg, png, gif, webp..."
+                                $h += "`n$bullet Fichiers : pdf, docx, xlsx, code..."
+                                $h += "`n$bullet Claude analyse le contenu et repond."
+                                if ($isMulti) {
+                                    $h += "`n"
+                                    $h += "`n$bullet Apres reception, le bot vous"
+                                    $h += "`n   demande de choisir la session."
+                                }
+
+                                # --- SECTION: Commandes ---
+                                $h += "`n`n$gear COMMANDES`n$sep"
+                                $h += "`n"
+                                $h += "`n$quest /help ou /aide"
+                                $h += "`n   Affiche ce guide complet."
+                                $h += "`n"
+                                $h += "`n$([char]0x25A0) /list"
+                                $h += "`n   Affiche toutes les sessions actives"
+                                $h += "`n   avec leur nom et dossier de travail."
+                                $h += "`n"
+                                $h += "`n$([char]0x25B6) /verbose"
+                                $h += "`n   Active le mode detaille :"
+                                $h += "`n   vous recevez les outils utilises par"
+                                $h += "`n   Claude (Bash, Read, Grep...), la"
+                                $h += "`n   progression en temps reel, puis le"
+                                $h += "`n   resultat final."
+                                if ($isMulti) {
+                                    $h += "`n   $bullet /verbose $arrow toutes les sessions"
+                                    $h += "`n   $bullet /verbose nom $arrow une session"
+                                    $h += "`n   $bullet /verbose nom1, nom2 $arrow plusieurs"
+                                }
+                                $h += "`n"
+                                $h += "`n$([char]0x25C0) /quiet"
+                                $h += "`n   Active le mode discret :"
+                                $h += "`n   vous recevez uniquement le resultat"
+                                $h += "`n   final de Claude, sans le detail des"
+                                $h += "`n   outils et commandes executees."
+                                if ($isMulti) {
+                                    $h += "`n   $bullet /quiet $arrow toutes les sessions"
+                                    $h += "`n   $bullet /quiet nom $arrow une session"
+                                    $h += "`n   $bullet /quiet nom1, nom2 $arrow plusieurs"
+                                }
+                                $h += "`n"
+                                $h += "`n$([char]0x2716) /stop"
+                                if ($isMulti) {
+                                    $h += "`n   Arrete les sessions Claude et ferme"
+                                    $h += "`n   les terminaux associes."
+                                    $h += "`n   $bullet /stop $arrow toutes les sessions"
+                                    $h += "`n   $bullet /stop nom $arrow une session"
+                                    $h += "`n   $bullet /stop nom1, nom2 $arrow plusieurs"
+                                } else {
+                                    $h += "`n   Arrete la session Claude et ferme"
+                                    $h += "`n   le terminal associe."
+                                }
+
+                                # --- SECTION: Infos session ---
+                                $h += "`n`n$info INFORMATIONS`n$sep"
+                                $h += "`n"
+                                $h += "`n$bullet Mode actuel : $modeNow"
+                                $h += "`n$bullet Session : @${Name}"
+                                if ($isMulti) {
+                                    $h += "`n$bullet Sessions actives ($($activeSessions.Count)) :"
+                                    foreach ($s in $activeSessions) {
+                                        $me = if ($s.Pid -eq $PID) { " $([char]0x2190) ici" } else { "" }
+                                        $h += "`n   $([char]0x2502) @$($s.Name) $([char]0x2014) $(Split-Path -Leaf $s.WorkDir)$me"
+                                    }
+                                }
+
+                                # --- SECTION: Astuces ---
+                                $h += "`n`n$([char]0x2605) ASTUCES`n$sep"
+                                $h += "`n"
+                                $h += "`n$bullet Types acceptes : texte, vocal,"
+                                $h += "`n   images, PDF, Word, Excel, code..."
+                                $h += "`n$bullet Claude peut lire, modifier et"
+                                $h += "`n   creer des fichiers dans le projet."
+
+                                Send-TelegramMessage -Message $h -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                                 continue
                             }
 
-                            # Use the cleaned text (without @prefix)
-                            $text = $routing.Text
-                            if (-not $text -or $text.Length -eq 0) { continue }
+                            # Toggle verbose/quiet mode (with session targeting in multi-session)
+                            if ($routing.IsCommand -and $routing.Text -match '^/verbose') {
+                                $script:TelegramVerbose = $true
+                                Send-TelegramMessage -Message "@${Name} : $([char]0x2699) Mode detaille ON" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                continue
+                            }
+                            if ($routing.IsCommand -and $routing.Text -match '^/quiet') {
+                                $script:TelegramVerbose = $false
+                                Send-TelegramMessage -Message "@${Name} : $([char]0x2709) Mode discret ON" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                continue
+                            }
+
+                            # Multi-session without target: store as pending and show choice list
+                            # Any session that receives this handles it (no "default" — Telegram offset race)
+                            if (-not $routing.ShouldHandle -and $routing.NeedsTarget) {
+                                # Check if another session already stored a pending for the same message (avoid duplicates)
+                                $existingPending = Join-Path $script:SessionRegistryDir "pending_message.json"
+                                if (-not (Test-Path $existingPending)) {
+                                    # Store pending message in SHARED file — use manual JSON to avoid PS 5 empty array issues
+                                    $safePT = ConvertTo-SafeJsonString -Value $text
+                                    $ts = (Get-Date).ToString("o")
+                                    $pendingJson = '{"Text":"' + $safePT + '","Type":"text","ImagePaths":[],"FilePaths":[],"Timestamp":"' + $ts + '","SenderPid":' + $PID + '}'
+                                    Set-Content -Path $existingPending -Value $pendingJson -Encoding UTF8 -ErrorAction SilentlyContinue
+                                    $script:WaitingForSessionChoice = $true
+                                    Send-SessionChoiceList -Token $config.TelegramBotToken -ChatId $config.TelegramChatId -MessagePreview $text
+                                    Write-Host "[ClaudePlus] Liste de choix envoyee (pending stocke)." -ForegroundColor Green
+                                } else {
+                                    Write-Host "[ClaudePlus] Pending existe deja (autre session a gere)." -ForegroundColor DarkGray
+                                }
+                                continue
+                            }
+
+                            if (-not $routing.ShouldHandle) { continue }
+
+                            } # end of: } else { (not choiceResolved — routing section)
 
                             # Skip if already waiting for a response
                             if ($waitingForResponse) {
-                                Send-TelegramMessage -Message "[@$Name] ATTENTE — Claude est en train de repondre, patientez..." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                Send-TelegramMessage -Message "@${Name} : ATTENTE — Claude est en train de repondre, patientez..." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                                 continue
                             }
 
@@ -1856,8 +2809,19 @@ function Invoke-ClaudePlus {
 
                             $waitingForResponse = $true
 
-                            # HYBRID: also send to TUI terminal for visual display
-                            Send-TextToClaude -Text $text | Out-Null
+                            # HYBRID: send to TUI terminal for visual display
+                            # Each session has its own WT window with unique title "ClaudePlus @Name"
+                            # so the window handle is correct even in multi-session
+                            if ($script:ClaudeWindowHandle -ne [IntPtr]::Zero) {
+                                $terminalText = $text
+                                if ($terminalText.Length -gt 200) {
+                                    $terminalText = $terminalText.Substring(0, 197) + "..."
+                                }
+                                $terminalText = ($terminalText -split "`n" | Where-Object { $_ -notmatch '\\claudeplus_|Fichier joint:|\[Image' }) -join " "
+                                if ($terminalText.Length -gt 0) {
+                                    Send-TextToClaude -Text $terminalText | Out-Null
+                                }
+                            }
 
                             # PIPE WITH RETRY ESCALATION:
                             # Attempt 1: stream-json (real-time updates)
@@ -1868,7 +2832,16 @@ function Invoke-ClaudePlus {
                             $useContinue = ($script:PipeMessageCount -gt 0)
 
                             # Attempt 1: stream-json
+                            Write-Host "[ClaudePlus] [DEBUG-MAIN] Texte exact envoye au pipe: '$text'" -ForegroundColor Magenta
+                            Write-Host "[ClaudePlus] [DEBUG-MAIN] choiceResolved=$choiceResolved, useContinue=$useContinue, PipeMessageCount=$($script:PipeMessageCount), PendingImages=$($script:PendingImagePaths.Count), PendingFiles=$($script:PendingFilePaths.Count)" -ForegroundColor Magenta
                             Write-Host "[ClaudePlus] Tentative 1/3: stream-json..." -ForegroundColor DarkGray
+                            # Gather attached files (images + documents)
+                            $imgArgs = @()
+                            if ($script:PendingImagePaths -and $script:PendingImagePaths.Count -gt 0) {
+                                $imgArgs = $script:PendingImagePaths
+                                $script:PendingImagePaths = @()
+                            }
+
                             $responseText = Invoke-ClaudePipe `
                                 -Message $text `
                                 -ClaudePath $claudePath `
@@ -1876,7 +2849,9 @@ function Invoke-ClaudePlus {
                                 -Continue:$useContinue `
                                 -DangerouslySkipPermissions:$useSkip `
                                 -TelegramToken $config.TelegramBotToken `
-                                -TelegramChatId $config.TelegramChatId
+                                -TelegramChatId $config.TelegramChatId `
+                                -SessionName $Name `
+                                -ImagePaths $imgArgs
 
                             # Attempt 2: plain pipe with --continue
                             if (-not $responseText -or $responseText.Length -le 3) {
@@ -1914,29 +2889,59 @@ function Invoke-ClaudePlus {
                                 Write-Host "  << $($responseText.Substring(0, $previewLen))$(if($responseText.Length -gt 200){'...'})" -ForegroundColor Green
                                 Write-Host ""
 
-                                # Truncate if too long for Telegram (4096 char limit)
-                                if ($responseText.Length -gt 3900) {
-                                    $responseText = $responseText.Substring(0, 3900) + "`n[... tronque]"
+                                # Build Telegram message — with or without tool details
+                                $toolSection = ""
+                                if ($script:TelegramVerbose -and $script:LastPipeTools -and $script:LastPipeToolCount -gt 0) {
+                                    $toolSection = "$([char]0x2699) Outils ($($script:LastPipeToolCount)):`n"
+                                    foreach ($t in $script:LastPipeTools) { $toolSection += "$t`n" }
+                                    $toolSection += "`n"
                                 }
-                                # Send final response with separator and session tag
-                                $finalMsg = "$([char]0x2500)$([char]0x2500) @$Name $([char]0x2500)$([char]0x2500)`n$responseText"
+
+                                # Truncate text if too long (4096 char limit minus tool section)
+                                $maxTextLen = 3900 - $toolSection.Length
+                                if ($maxTextLen -lt 500) { $maxTextLen = 500; $toolSection = "" }
+                                if ($responseText.Length -gt $maxTextLen) {
+                                    $responseText = $responseText.Substring(0, $maxTextLen) + "`n[... tronque]"
+                                }
+                                # Send final response with @name : prefix + tools (if verbose)
+                                $finalMsg = "@${Name} : ${toolSection}${responseText}"
                                 Send-TelegramMessage -Message $finalMsg -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                             } else {
                                 Write-Host "  << [ECHEC 3 tentatives]" -ForegroundColor Red
                                 Write-Host ""
-                                Send-TelegramMessage -Message "[@$Name] Echec apres 3 tentatives. Verifiez le terminal ou renvoyez le message." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                Send-TelegramMessage -Message "@${Name} : Echec apres 3 tentatives. Verifiez le terminal ou renvoyez le message." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                             }
+
+                            # Cleanup temp files (images + documents from TEMP)
+                            foreach ($tmpFile in ($imgArgs + $script:PendingFilePaths)) {
+                                if ($tmpFile -and (Test-Path $tmpFile)) {
+                                    Remove-Item $tmpFile -ErrorAction SilentlyContinue
+                                }
+                            }
+                            # Cleanup images copied to workdir
+                            Get-ChildItem -Path $workDir -Filter "telegram_claudeplus_*" -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue
+                            $script:PendingFilePaths = @()
                         }
                     }
                 }
-                catch { }
+                catch {
+                    if ($pollCount -le 5) {
+                        Write-Host "[ClaudePlus] Poll #$pollCount ERREUR: $_" -ForegroundColor Red
+                    }
+                }
 
-                Start-Sleep -Milliseconds 500
+                # Jitter sleep in multi-session to desync polls and reduce 409 conflicts
+                if ($multiSession) {
+                    $jitter = Get-Random -Minimum 300 -Maximum 1200
+                    Start-Sleep -Milliseconds $jitter
+                } else {
+                    Start-Sleep -Milliseconds 500
+                }
             }
         }
         finally {
             Unregister-Session -Name $Name
-            Send-TelegramMessage -Message "@$Name terminee." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+            Send-TelegramMessage -Message "@${Name} : Session terminee." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
             if (Test-Path $batPath) { Remove-Item $batPath -ErrorAction SilentlyContinue }
             Write-Host ""
             Write-Host "[ClaudePlus] Session '@$Name' terminee." -ForegroundColor DarkCyan
