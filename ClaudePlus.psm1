@@ -843,7 +843,9 @@ function Get-WindowHandleForPid {
 
 # ============================================================================
 # ============================================================================
-# PIPE MODE: Send message via 'claude -p' and capture clean stdout response
+# PIPE MODE with STREAMING: Send message via 'claude -p --output-format stream-json'
+# Reads JSON events line by line, sends real-time tool updates to Telegram,
+# accumulates text deltas for the final response.
 # No TUI, no buffer reading, no cursor artifacts, no size limit.
 # Uses --continue to maintain conversation context across messages.
 # ============================================================================
@@ -854,28 +856,18 @@ function Invoke-ClaudePipe {
         [string]$ClaudePath,
         [string]$WorkDir,
         [switch]$Continue,
-        [switch]$DangerouslySkipPermissions
+        [switch]$DangerouslySkipPermissions,
+        [string]$TelegramToken,
+        [string]$TelegramChatId
     )
 
-    # Write message to temp file to avoid shell escaping issues
-    $msgFile = "$env:TEMP\claudeplus_msg.txt"
-    [System.IO.File]::WriteAllText($msgFile, $Message, [System.Text.Encoding]::UTF8)
-
-    # Build argument list -- message passed as argument in quotes
-    # Escape inner double quotes for command line
     $escapedMsg = $Message -replace '"', '\"'
-    $argList = @("-p", "`"$escapedMsg`"")
+    $argList = @("-p", "`"$escapedMsg`"", "--output-format", "stream-json")
     if ($Continue) { $argList += "--continue" }
     if ($DangerouslySkipPermissions) { $argList += "--dangerously-skip-permissions" }
     $argStr = $argList -join " "
 
-    Write-Host "[ClaudePlus] Pipe: claude -p `"$Message`" $(if($Continue){'--continue '})$(if($DangerouslySkipPermissions){'--skip-perms'})" -ForegroundColor DarkCyan
-
-    # Use a temp file for output to avoid stdout blocking issues
-    $outFile = "$env:TEMP\claudeplus_pipe_out.txt"
-    $errFile = "$env:TEMP\claudeplus_pipe_err.txt"
-    Remove-Item $outFile -ErrorAction SilentlyContinue
-    Remove-Item $errFile -ErrorAction SilentlyContinue
+    Write-Host "[ClaudePlus] Stream: claude -p --output-format stream-json $(if($Continue){'--continue '})" -ForegroundColor DarkCyan
 
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -889,47 +881,235 @@ function Invoke-ClaudePipe {
         $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
         $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 
-        Write-Host "[ClaudePlus] Pipe: lancement..." -ForegroundColor DarkGray
+        Write-Host "[ClaudePlus] Stream: lancement..." -ForegroundColor DarkGray
         $proc = [System.Diagnostics.Process]::Start($psi)
 
-        # Read both streams async to prevent deadlock
-        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        # Read stderr async to prevent deadlock
         $stderrTask = $proc.StandardError.ReadToEndAsync()
 
-        # Wait with timeout (3 minutes max)
-        $exited = $proc.WaitForExit(180000)
+        # State tracking for streaming
+        $textBuilder = New-Object System.Text.StringBuilder
+        $toolsUsed = @()
+        $currentToolName = ""
+        $currentToolInput = ""
+        $lastTelegramUpdate = [DateTime]::MinValue
+        $telegramUpdateInterval = 3  # seconds between Telegram progress updates
+        $startTime = Get-Date
+        $toolCount = 0
+        $hasSentProgress = $false
 
-        if (-not $exited) {
-            Write-Host "[ClaudePlus] Pipe: timeout 3min, kill" -ForegroundColor Yellow
-            try { $proc.Kill() } catch { }
-            return $null
+        # Emoji map for tool types
+        $toolEmojis = @{
+            "Read"    = [char]0x1F4D6   # open book
+            "Write"   = [char]0x270F    # pencil
+            "Edit"    = [char]0x2702    # scissors
+            "Bash"    = [char]0x2699    # gear
+            "Grep"    = [char]0x1F50D   # magnifying glass
+            "Glob"    = [char]0x1F4C2   # open folder
+            "Search"  = [char]0x1F50E   # magnifying glass right
+            "Agent"   = [char]0x1F916   # robot
+            "Explore" = [char]0x1F9ED   # compass
         }
 
-        $exitCode = $proc.ExitCode
-        $output = $stdoutTask.Result
-        $stderr = $stderrTask.Result
+        # Read stdout line by line (NDJSON stream)
+        while (-not $proc.StandardOutput.EndOfStream) {
+            $line = $proc.StandardOutput.ReadLine()
+            if (-not $line -or $line.Trim().Length -eq 0) { continue }
 
-        Write-Host "[ClaudePlus] Pipe: exit=$exitCode stdout=$($output.Length) stderr=$($stderr.Length)" -ForegroundColor DarkGray
+            try {
+                $event = $line | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                # Not valid JSON, skip
+                continue
+            }
+
+            # Handle different event structures
+            # Claude Code CLI may wrap events or send them directly
+            $eventType = $null
+            $eventData = $null
+
+            # Try direct event format: {"type": "content_block_start", ...}
+            if ($event.type) {
+                $eventType = $event.type
+                $eventData = $event
+            }
+            # Try wrapped format: {"event": {"type": "content_block_start", ...}}
+            if ($event.event -and $event.event.type) {
+                $eventType = $event.event.type
+                $eventData = $event.event
+            }
+            # Try subtype format: {"type": "assistant", "subtype": "...", ...}
+            if ($event.subtype) {
+                $eventType = $event.subtype
+                $eventData = $event
+            }
+
+            if (-not $eventType) { continue }
+
+            switch ($eventType) {
+                "content_block_start" {
+                    $block = $eventData.content_block
+                    if (-not $block) { $block = $eventData }
+                    if ($block.type -eq "tool_use" -and $block.name) {
+                        $currentToolName = $block.name
+                        $currentToolInput = ""
+                        $toolCount++
+
+                        # Get emoji for this tool
+                        $emoji = $toolEmojis[$currentToolName]
+                        if (-not $emoji) { $emoji = [char]0x26A1 }  # lightning bolt default
+
+                        $toolDisplay = "$emoji $currentToolName"
+                        $toolsUsed += $toolDisplay
+                        Write-Host "[ClaudePlus] Stream: Tool #$toolCount -> $currentToolName" -ForegroundColor Magenta
+
+                        # Send Telegram progress update (throttled)
+                        $now = Get-Date
+                        $elapsed = [int]($now - $startTime).TotalSeconds
+                        if ($TelegramToken -and $TelegramChatId) {
+                            $secsSinceUpdate = ($now - $lastTelegramUpdate).TotalSeconds
+                            if ($secsSinceUpdate -ge $telegramUpdateInterval -or $toolCount -eq 1) {
+                                $progressMsg = "$([char]0x23F3) Claude travaille... (${elapsed}s)`n"
+                                foreach ($t in $toolsUsed) {
+                                    $progressMsg += "  $t`n"
+                                }
+                                Send-TelegramMessage -Message $progressMsg.TrimEnd() -Token $TelegramToken -ChatId $TelegramChatId
+                                $lastTelegramUpdate = $now
+                                $hasSentProgress = $true
+                            }
+                        }
+                    }
+                }
+                "content_block_delta" {
+                    $delta = $eventData.delta
+                    if (-not $delta) { $delta = $eventData }
+                    if ($delta.type -eq "text_delta" -and $delta.text) {
+                        [void]$textBuilder.Append($delta.text)
+                    }
+                    if ($delta.type -eq "input_json_delta" -and $delta.partial_json) {
+                        $currentToolInput += $delta.partial_json
+                    }
+                }
+                "content_block_stop" {
+                    if ($currentToolName) {
+                        # Try to extract a short description from tool input
+                        $inputPreview = ""
+                        if ($currentToolInput.Length -gt 0) {
+                            try {
+                                $inputObj = $currentToolInput | ConvertFrom-Json -ErrorAction Stop
+                                # Extract meaningful field (pattern, command, file_path, etc.)
+                                $preview = $inputObj.pattern
+                                if (-not $preview) { $preview = $inputObj.command }
+                                if (-not $preview) { $preview = $inputObj.file_path }
+                                if (-not $preview) { $preview = $inputObj.path }
+                                if (-not $preview) { $preview = $inputObj.description }
+                                if ($preview) {
+                                    if ($preview.Length -gt 60) { $preview = $preview.Substring(0, 57) + "..." }
+                                    $inputPreview = ": $preview"
+                                }
+                            } catch { }
+                        }
+                        if ($inputPreview) {
+                            Write-Host "[ClaudePlus] Stream:   -> $currentToolName$inputPreview" -ForegroundColor DarkMagenta
+                            # Update the last tool entry with detail
+                            if ($toolsUsed.Count -gt 0) {
+                                $emoji = $toolEmojis[$currentToolName]
+                                if (-not $emoji) { $emoji = [char]0x26A1 }
+                                $toolsUsed[$toolsUsed.Count - 1] = "$emoji $currentToolName$inputPreview"
+                            }
+                        }
+                        $currentToolName = ""
+                        $currentToolInput = ""
+                    }
+                }
+                "message_stop" {
+                    Write-Host "[ClaudePlus] Stream: message_stop" -ForegroundColor DarkGray
+                }
+            }
+        }
+
+        # Wait for process to finish
+        $exited = $proc.WaitForExit(30000)
+        if (-not $exited) { try { $proc.Kill() } catch { } }
+
+        $stderr = $stderrTask.Result
+        $exitCode = if ($proc.HasExited) { $proc.ExitCode } else { -1 }
+        $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
+
+        Write-Host "[ClaudePlus] Stream: exit=$exitCode, ${elapsed}s, $toolCount tools, $($textBuilder.Length) chars" -ForegroundColor DarkGray
 
         if ($stderr -and $stderr.Trim().Length -gt 0) {
             $stderrPreview = $stderr.Substring(0, [Math]::Min(300, $stderr.Length))
-            Write-Host "[ClaudePlus] Pipe stderr: $stderrPreview" -ForegroundColor DarkGray
+            Write-Host "[ClaudePlus] Stream stderr: $stderrPreview" -ForegroundColor DarkGray
         }
 
-        $result = $output.Trim()
+        # Send final progress summary if tools were used
+        if ($TelegramToken -and $TelegramChatId -and $toolCount -gt 0) {
+            $summaryMsg = "$([char]0x2705) Termine (${elapsed}s, $toolCount outils)`n"
+            foreach ($t in $toolsUsed) {
+                $summaryMsg += "  $t`n"
+            }
+            Send-TelegramMessage -Message $summaryMsg.TrimEnd() -Token $TelegramToken -ChatId $TelegramChatId
+        }
+
+        $result = $textBuilder.ToString().Trim()
         if ($result.Length -gt 0) {
-            Write-Host "[ClaudePlus] Pipe: reponse OK ($($result.Length) chars)" -ForegroundColor Green
+            Write-Host "[ClaudePlus] Stream: reponse OK ($($result.Length) chars)" -ForegroundColor Green
             return $result
         } else {
-            Write-Host "[ClaudePlus] Pipe: reponse vide (exit=$exitCode)" -ForegroundColor Yellow
-            # If stdout empty, maybe response is in stderr?
-            if ($stderr -and $stderr.Trim().Length -gt 10) {
-                return $stderr.Trim()
-            }
-            return $null
+            Write-Host "[ClaudePlus] Stream: reponse vide (exit=$exitCode)" -ForegroundColor Yellow
+            # Fallback: if stream-json produced no text, try plain pipe mode
+            Write-Host "[ClaudePlus] Stream: fallback vers pipe mode classique..." -ForegroundColor Yellow
+            return Invoke-ClaudePipePlain -Message $Message -ClaudePath $ClaudePath -WorkDir $WorkDir -Continue:$Continue -DangerouslySkipPermissions:$DangerouslySkipPermissions
         }
     } catch {
-        Write-Host "[ClaudePlus] Pipe erreur: $_" -ForegroundColor Red
+        Write-Host "[ClaudePlus] Stream erreur: $_" -ForegroundColor Red
+        # Fallback to plain pipe
+        return Invoke-ClaudePipePlain -Message $Message -ClaudePath $ClaudePath -WorkDir $WorkDir -Continue:$Continue -DangerouslySkipPermissions:$DangerouslySkipPermissions
+    }
+}
+
+# Fallback plain pipe mode (no streaming, no Telegram updates)
+function Invoke-ClaudePipePlain {
+    param(
+        [string]$Message,
+        [string]$ClaudePath,
+        [string]$WorkDir,
+        [switch]$Continue,
+        [switch]$DangerouslySkipPermissions
+    )
+
+    $escapedMsg = $Message -replace '"', '\"'
+    $argList = @("-p", "`"$escapedMsg`"")
+    if ($Continue) { $argList += "--continue" }
+    if ($DangerouslySkipPermissions) { $argList += "--dangerously-skip-permissions" }
+    $argStr = $argList -join " "
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $ClaudePath
+        $psi.Arguments = $argStr
+        $psi.WorkingDirectory = $WorkDir
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        $exited = $proc.WaitForExit(180000)
+        if (-not $exited) { try { $proc.Kill() } catch { }; return $null }
+
+        $result = $stdoutTask.Result.Trim()
+        if ($result.Length -gt 0) { return $result }
+        $stderr = $stderrTask.Result.Trim()
+        if ($stderr.Length -gt 10) { return $stderr }
+        return $null
+    } catch {
+        Write-Host "[ClaudePlus] PipePlain erreur: $_" -ForegroundColor Red
         return $null
     }
 }
@@ -1287,28 +1467,33 @@ function Invoke-ClaudePlus {
                             # HYBRID: also send to TUI terminal for visual display
                             Send-TextToClaude -Text $text | Out-Null
 
-                            # Use pipe mode for clean response capture
+                            # Use streaming pipe mode for clean response + real-time Telegram updates
                             $useSkip = ($config.DangerouslySkipPermissions -eq $true)
                             $responseText = Invoke-ClaudePipe `
                                 -Message $text `
                                 -ClaudePath $claudePath `
                                 -WorkDir $workDir `
                                 -Continue:($script:PipeMessageCount -gt 0) `
-                                -DangerouslySkipPermissions:$useSkip
+                                -DangerouslySkipPermissions:$useSkip `
+                                -TelegramToken $config.TelegramBotToken `
+                                -TelegramChatId $config.TelegramChatId
 
                             $script:PipeMessageCount++
                             $waitingForResponse = $false
 
                             if ($responseText -and $responseText.Length -gt 3) {
                                 # Show response in PS console
-                                Write-Host "  << $responseText" -ForegroundColor Green
+                                $previewLen = [Math]::Min(200, $responseText.Length)
+                                Write-Host "  << $($responseText.Substring(0, $previewLen))$(if($responseText.Length -gt 200){'...'})" -ForegroundColor Green
                                 Write-Host ""
 
                                 # Truncate if too long for Telegram (4096 char limit)
                                 if ($responseText.Length -gt 3900) {
                                     $responseText = $responseText.Substring(0, 3900) + "`n[... tronque]"
                                 }
-                                Send-TelegramMessage -Message $responseText -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                # Send final response with separator
+                                $finalMsg = "$([char]0x2500)$([char]0x2500)$([char]0x2500) Reponse $([char]0x2500)$([char]0x2500)$([char]0x2500)`n$responseText"
+                                Send-TelegramMessage -Message $finalMsg -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
                             } else {
                                 Write-Host "  << [pas de reponse]" -ForegroundColor Yellow
                                 Write-Host ""
