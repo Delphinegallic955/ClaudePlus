@@ -29,6 +29,12 @@ $script:LastPipeTools = @()
 $script:LastPipeToolCount = 0
 $script:LastPipeElapsed = 0
 $script:TelegramVerbose = $true  # true = outils+progression+resultat, false = resultat seulement
+$script:MirrorTerminal = $false  # true = envoie sur Telegram ce qui s'affiche dans le terminal Claude
+$script:LastMirrorFile = ""
+$script:LastMirrorFileSize = 0
+$script:LastMirrorLineCount = 0
+$script:LastMirrorModTime = $null
+$script:MirrorPollCounter = 0
 
 # ============================================================================
 # READ CLAUDE CONSOLE OUTPUT
@@ -547,6 +553,7 @@ function Get-ClaudePlusConfig {
             TelegramChatId = ""
             DangerouslySkipPermissions = $true
             AutoTelegram = $true
+            MirrorTerminal = $false
         }
     }
     if ([string]::IsNullOrEmpty($config.TelegramBotToken)) {
@@ -1734,8 +1741,8 @@ function Write-DispatchFile {
 function Test-MessageForMe {
     param([string]$RawText)
 
-    # Commands: /stop, /list, /help, /verbose, /quiet
-    if ($RawText -match '^/(stop|list|sessions|help|aide|verbose|quiet)') {
+    # Commands: /stop, /list, /help, /verbose, /quiet, /mirror
+    if ($RawText -match '^/(stop|list|sessions|help|aide|verbose|quiet|mirror)') {
         $cmdParsed = Parse-CommandTargets -CommandText $RawText
         $activeSessions = Get-ActiveSessions
 
@@ -1748,7 +1755,7 @@ function Test-MessageForMe {
             return @{ ShouldHandle = $false; Text = ""; IsCommand = $true; CommandTargets = @() }
         }
 
-        # /stop, /verbose, /quiet: check if targets include me
+        # /stop, /verbose, /quiet, /mirror: check if targets include me
         if ($activeSessions.Count -le 1) {
             return @{ ShouldHandle = $true; Text = $RawText; IsCommand = $true; CommandTargets = $cmdParsed.Targets }
         }
@@ -1815,6 +1822,9 @@ function Invoke-ClaudePlus {
     Write-Host ""
 
     $useTelegram = (-not $NoTelegram -and $config.AutoTelegram -and $config.TelegramBotToken -and $config.TelegramChatId)
+
+    # Initialize mirror terminal from config
+    if ($config.MirrorTerminal -eq $true) { $script:MirrorTerminal = $true }
 
     if ($useTelegram) {
         # Register this session
@@ -2048,6 +2058,9 @@ function Invoke-ClaudePlus {
             Write-Host "[ClaudePlus] Handle fenetre final: $($script:ClaudeWindowHandle) (SendKeys actif)" -ForegroundColor Green
         }
 
+        # Initialize console reader (compiled .exe for reading Claude terminal buffer)
+        Initialize-ConsoleReader
+
         # Initialize voice transcription (Python + faster-whisper + ffmpeg)
         $voiceOk = Initialize-Transcription
 
@@ -2068,7 +2081,9 @@ function Invoke-ClaudePlus {
         }
         $modeLabel = if ($script:TelegramVerbose) { "detaille" } else { "discret" }
         $startupLines += "Mode: $modeLabel (/verbose ou /quiet)"
-        $startupLines += "/help | /list | /verbose | /quiet | /stop"
+        $mirrorLabel = if ($script:MirrorTerminal) { "ON" } else { "OFF" }
+        $startupLines += "Mirror terminal: $mirrorLabel (/mirror)"
+        $startupLines += "/help | /list | /verbose | /quiet | /mirror | /stop"
 
         # Wait for Claude TUI to start in the visible terminal BEFORE sending Telegram notification
         Write-Host "[ClaudePlus] Attente demarrage Claude TUI (3s)..." -ForegroundColor DarkGray
@@ -2120,6 +2135,133 @@ function Invoke-ClaudePlus {
                     if ($script:ClaudeCmdPid -gt 0) {
                         $cmdProc = Get-Process -Id $script:ClaudeCmdPid -ErrorAction SilentlyContinue
                         if (-not $cmdProc) { Write-Host "[ClaudePlus] cmd.exe termine, arret." -ForegroundColor Yellow; break }
+                    }
+                }
+
+                # --- MIRROR TERMINAL TO TELEGRAM (if enabled) ---
+                # Reads Claude Code's JSONL conversation file to detect new messages
+                if ($script:MirrorTerminal) {
+                    $script:MirrorPollCounter++
+                    # Check every ~3 poll cycles (~1.5s)
+                    if ($script:MirrorPollCounter % 3 -eq 0) {
+                        try {
+                            # Find the most recently modified JSONL across ALL project folders
+                            $claudeDir = Join-Path $env:USERPROFILE ".claude\projects"
+                            if (Test-Path $claudeDir) {
+                                $latestJsonl = Get-ChildItem -Path $claudeDir -Filter "*.jsonl" -Recurse -ErrorAction SilentlyContinue |
+                                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+                                if ($latestJsonl) {
+                                    # Detect file change (new conversation or same file grew)
+                                    $currentFile = $latestJsonl.FullName
+                                    $currentSize = $latestJsonl.Length
+                                    $currentMod = $latestJsonl.LastWriteTime
+
+                                    # If file changed (new conversation), start reading from line 0
+                                    $isNewFile = ($currentFile -ne $script:LastMirrorFile)
+                                    if ($isNewFile) {
+                                        Write-Host "[Mirror] Nouveau fichier detecte: $(Split-Path -Leaf $currentFile)" -ForegroundColor Cyan
+                                        $script:LastMirrorFile = $currentFile
+                                        $script:LastMirrorLineCount = 0
+                                        $script:LastMirrorFileSize = 0
+                                        $script:LastMirrorModTime = $null
+                                    }
+                                    # Read new lines if file changed (new or grown)
+                                    if ($isNewFile -or $currentSize -ne $script:LastMirrorFileSize -or $currentMod -ne $script:LastMirrorModTime) {
+                                        $script:LastMirrorFileSize = $currentSize
+                                        $script:LastMirrorModTime = $currentMod
+
+                                        $allLines = [System.IO.File]::ReadAllLines($currentFile, [System.Text.Encoding]::UTF8)
+                                        $totalLines = $allLines.Count
+                                        Write-Host "[Mirror] Fichier: $totalLines lignes total, LastLineCount=$($script:LastMirrorLineCount)" -ForegroundColor DarkGray
+
+                                        if ($totalLines -gt $script:LastMirrorLineCount) {
+                                            $newLines = $allLines[$script:LastMirrorLineCount..($totalLines - 1)]
+                                            $script:LastMirrorLineCount = $totalLines
+                                            Write-Host "[Mirror] $($newLines.Count) nouvelles lignes a traiter" -ForegroundColor DarkGray
+
+                                            foreach ($jsonLine in $newLines) {
+                                                if (-not $jsonLine -or $jsonLine.Length -lt 5) { continue }
+                                                try {
+                                                    $entry = $jsonLine | ConvertFrom-Json
+                                                    $msgText = $null
+                                                    $role = ""
+
+                                                    $entryType = if ($entry.type) { $entry.type } else { "(no type)" }
+                                                    Write-Host "[Mirror] Ligne type='$entryType' len=$($jsonLine.Length)" -ForegroundColor DarkGray
+
+                                                    # Skip system/init/progress entries — only show user and assistant
+                                                    if ($entry.type -and $entry.type -notin @("human", "user", "assistant")) { continue }
+
+                                                    # User message (type "user" in Claude Code JSONL, or "human" in older format)
+                                                    if ($entry.type -eq "human" -or $entry.type -eq "user") {
+                                                        $role = "$([char]0x270F) Vous"
+                                                        # "user" type: content may be in $entry.message.content or directly in $entry.content
+                                                        $contentSource = $null
+                                                        if ($entry.message -and $entry.message.content) { $contentSource = $entry.message.content }
+                                                        elseif ($entry.content) { $contentSource = $entry.content }
+                                                        if ($contentSource) {
+                                                            if ($contentSource -is [string]) {
+                                                                $msgText = $contentSource
+                                                            } elseif ($contentSource.Count -gt 0) {
+                                                                $texts = @()
+                                                                foreach ($block in $contentSource) {
+                                                                    if ($block.type -eq "text" -and $block.text) { $texts += $block.text }
+                                                                    elseif ($block -is [string]) { $texts += $block }
+                                                                }
+                                                                $msgText = $texts -join "`n"
+                                                            }
+                                                        }
+                                                    }
+
+                                                    # Assistant message
+                                                    if ($entry.type -eq "assistant") {
+                                                        $role = "$([char]0x2699) Claude"
+                                                        # Check content source (message.content or content directly)
+                                                        $aContent = $null
+                                                        if ($entry.message -and $entry.message.content) { $aContent = $entry.message.content }
+                                                        elseif ($entry.content) { $aContent = $entry.content }
+                                                        if ($aContent) {
+                                                            $texts = @()
+                                                            $hasOnlyTools = $true
+                                                            foreach ($block in $aContent) {
+                                                                if ($block.type -eq "text" -and $block.text) {
+                                                                    $texts += $block.text
+                                                                    $hasOnlyTools = $false
+                                                                }
+                                                                if ($block.type -eq "tool_use") {
+                                                                    # In quiet mode, skip tool details entirely
+                                                                    if ($script:TelegramVerbose) {
+                                                                        $toolName = if ($block.name) { $block.name } else { "tool" }
+                                                                        $texts += "[$([char]0x2699) $toolName]"
+                                                                    }
+                                                                }
+                                                            }
+                                                            # In quiet mode, skip messages that contain ONLY tool_use (no text)
+                                                            if (-not $script:TelegramVerbose -and $hasOnlyTools) { $msgText = $null }
+                                                            else { $msgText = $texts -join "`n" }
+                                                        }
+                                                    }
+
+                                                    if ($msgText -and $msgText.Trim().Length -gt 0) {
+                                                        $msgText = $msgText.Trim()
+                                                        if ($msgText.Length -gt 3800) {
+                                                            $msgText = $msgText.Substring(0, 3800) + "`n... (tronque)"
+                                                        }
+                                                        Send-TelegramMessage -Message "@${Name} $([char]0x25C9) ${role}:`n$msgText" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                                        Write-Host "[Mirror] $role : $($msgText.Substring(0, [Math]::Min(80, $msgText.Length)))..." -ForegroundColor Magenta
+                                                    }
+                                                } catch {
+                                                    # Not valid JSON or unexpected structure — skip
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch {
+                            Write-Host "[Mirror] Erreur: $_" -ForegroundColor DarkYellow
+                        }
                     }
                 }
 
@@ -2723,6 +2865,18 @@ function Invoke-ClaudePlus {
                                     $h += "`n   $bullet /quiet nom1, nom2 $arrow plusieurs"
                                 }
                                 $h += "`n"
+                                $mirrorStatus = if ($script:MirrorTerminal) { "ON" } else { "OFF" }
+                                $h += "`n$([char]0x25C9) /mirror (actuellement $mirrorStatus)"
+                                $h += "`n   Active/desactive le mirroring du"
+                                $h += "`n   terminal Claude vers Telegram."
+                                $h += "`n   Quand actif, tout ce qui s'affiche"
+                                $h += "`n   dans le terminal est envoye sur"
+                                $h += "`n   Telegram (meme le chat direct)."
+                                if ($isMulti) {
+                                    $h += "`n   $bullet /mirror $arrow toutes les sessions"
+                                    $h += "`n   $bullet /mirror nom $arrow une session"
+                                }
+                                $h += "`n"
                                 $h += "`n$([char]0x2716) /stop"
                                 if ($isMulti) {
                                     $h += "`n   Arrete les sessions Claude et ferme"
@@ -2769,6 +2923,35 @@ function Invoke-ClaudePlus {
                             if ($routing.IsCommand -and $routing.Text -match '^/quiet') {
                                 $script:TelegramVerbose = $false
                                 Send-TelegramMessage -Message "@${Name} : $([char]0x2709) Mode discret ON" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                continue
+                            }
+                            if ($routing.IsCommand -and $routing.Text -match '^/mirror') {
+                                $script:MirrorTerminal = -not $script:MirrorTerminal
+                                if ($script:MirrorTerminal) {
+                                    # Snapshot: find latest JSONL and record its current line count
+                                    $script:LastMirrorFile = ""
+                                    $script:LastMirrorFileSize = 0
+                                    $script:LastMirrorLineCount = 0
+                                    $script:LastMirrorModTime = $null
+                                    try {
+                                        $claudeDir = Join-Path $env:USERPROFILE ".claude\projects"
+                                        if (Test-Path $claudeDir) {
+                                            $latestJsonl = Get-ChildItem -Path $claudeDir -Filter "*.jsonl" -Recurse -ErrorAction SilentlyContinue |
+                                                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                                            if ($latestJsonl) {
+                                                $script:LastMirrorFile = $latestJsonl.FullName
+                                                $script:LastMirrorFileSize = $latestJsonl.Length
+                                                $script:LastMirrorModTime = $latestJsonl.LastWriteTime
+                                                $allLines = [System.IO.File]::ReadAllLines($latestJsonl.FullName, [System.Text.Encoding]::UTF8)
+                                                $script:LastMirrorLineCount = $allLines.Count
+                                                Write-Host "[Mirror] Snapshot: $($script:LastMirrorLineCount) lignes dans $(Split-Path -Leaf $latestJsonl.FullName)" -ForegroundColor DarkGray
+                                            }
+                                        }
+                                    } catch { }
+                                    Send-TelegramMessage -Message "@${Name} : $([char]0x25C9) Mirror terminal ON`nLes messages du terminal seront envoyes ici." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                } else {
+                                    Send-TelegramMessage -Message "@${Name} : $([char]0x25C9) Mirror terminal OFF" -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
+                                }
                                 continue
                             }
 
@@ -2943,6 +3126,8 @@ function Invoke-ClaudePlus {
             Unregister-Session -Name $Name
             Send-TelegramMessage -Message "@${Name} : Session terminee." -Token $config.TelegramBotToken -ChatId $config.TelegramChatId
             if (Test-Path $batPath) { Remove-Item $batPath -ErrorAction SilentlyContinue }
+
+            # Restore the hidden launcher window so user gets their PowerShell back
             Write-Host ""
             Write-Host "[ClaudePlus] Session '@$Name' terminee." -ForegroundColor DarkCyan
         }
@@ -2968,7 +3153,8 @@ function Set-ClaudePlusConfig {
         [string]$TelegramBotToken,
         [string]$TelegramChatId,
         [Nullable[bool]]$DangerouslySkipPermissions,
-        [Nullable[bool]]$AutoTelegram
+        [Nullable[bool]]$AutoTelegram,
+        [Nullable[bool]]$MirrorTerminal
     )
     $config = Get-ClaudePlusConfig
     $changed = $false
@@ -2976,6 +3162,14 @@ function Set-ClaudePlusConfig {
     if ($TelegramChatId) { $config.TelegramChatId = $TelegramChatId; $changed = $true }
     if ($null -ne $DangerouslySkipPermissions) { $config.DangerouslySkipPermissions = $DangerouslySkipPermissions; $changed = $true }
     if ($null -ne $AutoTelegram) { $config.AutoTelegram = $AutoTelegram; $changed = $true }
+    if ($null -ne $MirrorTerminal) {
+        # Ensure property exists on config object
+        if (-not ($config.PSObject.Properties.Name -contains 'MirrorTerminal')) {
+            $config | Add-Member -NotePropertyName 'MirrorTerminal' -NotePropertyValue $false
+        }
+        $config.MirrorTerminal = $MirrorTerminal
+        $changed = $true
+    }
     if ($changed) {
         Save-ClaudePlusConfig $config
         Write-Host "[ClaudePlus] Configuration sauvegardee." -ForegroundColor Green
@@ -2990,6 +3184,8 @@ function Set-ClaudePlusConfig {
     Write-Host "  TelegramChatId   : $chatIdDisplay" -ForegroundColor White
     Write-Host "  SkipPermissions  : $($config.DangerouslySkipPermissions)" -ForegroundColor White
     Write-Host "  AutoTelegram     : $($config.AutoTelegram)" -ForegroundColor White
+    $mirrorVal = if ($config.MirrorTerminal -eq $true) { "True" } else { "False" }
+    Write-Host "  MirrorTerminal   : $mirrorVal" -ForegroundColor White
     Write-Host ""
 }
 

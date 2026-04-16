@@ -9,7 +9,7 @@
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue?logo=powershell)](https://microsoft.com/powershell)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue?logo=windows)](https://microsoft.com/windows)
-[![Version](https://img.shields.io/badge/Version-3.0-orange)](https://github.com/hayefmajid/ClaudePlus)
+[![Version](https://img.shields.io/badge/Version-3.1-orange)](https://github.com/hayefmajid/ClaudePlus)
 
 </div>
 
@@ -49,6 +49,14 @@ Send text, voice, images, or files from Telegram. ClaudePlus routes your message
 - **Images & files** — send photos, PDFs, Word docs, Excel files; Claude processes them
 - **Real-time streaming** — tool progress updates appear on Telegram as Claude works
 - **Verbose mode** — `/verbose` shows which tools Claude used (Read, Edit, Bash, etc.)
+
+### Terminal Mirror (`/mirror`)
+- **See direct terminal conversations on Telegram** — when you chat with Claude directly in the terminal, the messages appear on Telegram too
+- **Reads Claude Code's JSONL conversation files** — no console buffer hacking, works with Windows Terminal
+- **User messages** (`✏ Vous`) and **Claude responses** (`⚙ Claude`) are sent to Telegram in real-time
+- **Respects `/quiet` mode** — in quiet mode, only final text responses are shown (no tool details); in verbose mode, tool names are included
+- **Auto-detects new conversations** — when you start a new chat in the terminal, the mirror picks it up automatically
+- **Toggle on/off** via `/mirror` command on Telegram, or set permanently with `claudeplus-config -MirrorTerminal $true`
 
 ### Hybrid Architecture
 Each message follows two paths simultaneously:
@@ -243,6 +251,8 @@ All commands support **session targeting** in multi-session mode. Without a targ
 | `/quiet` | Enable quiet mode — shows only the final response, no tool details |
 | `/quiet name` | Enable quiet for a specific session |
 | `/quiet n1, n2` | Enable quiet for multiple sessions |
+| `/mirror` | Toggle terminal mirror — sends direct terminal conversations to Telegram |
+| `/mirror name` | Toggle mirror for a specific session |
 | `/stop` | Stop all sessions and close their terminals |
 | `/stop name` | Stop a specific session |
 | `/stop n1, n2` | Stop multiple sessions |
@@ -275,6 +285,9 @@ claudeplus-config -TelegramBotToken "YOUR_TOKEN" -TelegramChatId "YOUR_ID"
 
 # Toggle dangerous permissions (skip Claude Code confirmations)
 claudeplus-config -DangerouslySkipPermissions $true
+
+# Enable terminal mirror by default (direct chats appear on Telegram)
+claudeplus-config -MirrorTerminal $true
 
 # Force reimport after code changes
 Import-Module .\ClaudePlus.psm1 -Force
@@ -407,6 +420,16 @@ Import-Module .\ClaudePlus.psm1 -Force
 ---
 
 ## Version History
+
+### v3.1 — Terminal Mirror & Commands
+- **`/mirror` command** — toggle terminal mirroring to Telegram: see direct Claude Code conversations on your phone
+- Reads Claude Code's JSONL conversation files (works with Windows Terminal, no console buffer hacking)
+- Auto-detects new conversations when you start a new chat in the terminal
+- **`/quiet` + `/mirror` combo** — in quiet mode, mirror only shows final text responses (no tool details)
+- **`/verbose` + `/mirror` combo** — shows tool names in mirror messages
+- `MirrorTerminal` config option for persistent default (`claudeplus-config -MirrorTerminal $true`)
+- Expanded Telegram commands documentation
+- Detailed voice transcription pipeline documentation (PyAV, faster-whisper, GPU, VAD, fallbacks)
 
 ### v3.0 — Multi-Session Numbered Picker
 - Replace `@name` prefix routing with numbered session picker
